@@ -1,0 +1,4 @@
+from .models import Tick
+def normalize_tick(broker,raw):
+ if not isinstance(raw,dict):raise ValueError('RAW_TICK_NOT_OBJECT')
+ d=raw.get('data',raw);return Tick(broker=broker,exchange=d.get('exchange','UNKNOWN'),instrument_token=str(d.get('instrument_token',d.get('token',''))),symbol=d.get('symbol',d.get('trading_symbol','UNKNOWN')),underlying=d.get('underlying'),expiry=d.get('expiry'),strike=d.get('strike'),option_type=d.get('option_type'),ltp=float(d.get('ltp',0) or 0),bid=float(d.get('bid',0) or 0),ask=float(d.get('ask',0) or 0),volume=int(d.get('volume',0) or 0),oi=int(d.get('oi',0) or 0),iv=(float(d.get('iv')) if d.get('iv') not in (None,'') else None),sequence=d.get('sequence'),exchange_ts_ms=int(d.get('exchange_ts_ms',d.get('timestamp_ms',0)) or 0),receive_ts_ms=int(d.get('receive_ts_ms',0) or 0))

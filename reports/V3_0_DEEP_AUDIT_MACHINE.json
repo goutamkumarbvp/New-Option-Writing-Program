@@ -1,0 +1,11 @@
+{
+  "version": "VERSION = '3.0.0'",
+  "python_files": 34,
+  "python_lines": 1709,
+  "routes": 27,
+  "ast_parse": "PASS",
+  "dangerous_dynamic_execution": [],
+  "hardcoded_secret_candidates": [],
+  "pytest_returncode": 0,
+  "pytest_output": ".........................................................                [100%]\n57 passed in 0.29s"
+}
