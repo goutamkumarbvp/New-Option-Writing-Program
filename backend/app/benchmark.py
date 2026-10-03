@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from math import log
 @dataclass(frozen=True)
 class VolPoint: strike:float; iv:float; weight:float=1.0
 class VolSurfaceEngine:
@@ -24,8 +23,8 @@ class ScenarioRiskEngine:
    for dv in vol_shocks:
     pnl=0
     for p in positions:
-     q=float(p.get('qty',0))*float(p.get('multiplier',1));dS=float(p.get('spot',0))*ds
-     pnl+=q*(float(p.get('delta',0))*dS+.5*float(p.get('gamma',0))*dS*dS+float(p.get('vega',0))*dv+float(p.get('theta',0))*days)
+     q=float(p.get('qty',0))*float(p.get('multiplier',p.get('lot_size',1)));dS=float(p.get('spot',0))*ds
+     pnl+=q*(float(p.get('delta',0))*dS+.5*float(p.get('gamma',0))*dS*dS+float(p.get('vega',0))*dv*100+float(p.get('theta',0))*days)  # vega is per 1 vol point; dv is an absolute vol fraction (0.10 = 10 points)
     out.append({'spot_shock':ds,'vol_shock':dv,'pnl':pnl})
   return {'ok':True,'scenarios':out,'worst_pnl':min(x['pnl'] for x in out)}
 class PortfolioGreeks:

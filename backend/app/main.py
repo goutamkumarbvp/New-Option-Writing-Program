@@ -1,317 +1,417 @@
-import asyncio,uuid
+"""Application wiring.
+
+``Terminal`` owns every long-lived component; ``create_app`` exposes it over HTTP
+and WebSocket. Tests build their own Terminal with fake brokers and an in-memory
+ledger instead of patching module globals.
+"""
+import asyncio
+import json
+import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI,WebSocket,Header
-from fastapi.responses import FileResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from .config import settings
-from .models import Tick,OrderRequest
-from .market import MarketDataGateway
-from .ledger import Ledger
-from .brokers import BrokerRegistry
-from .watchdog import Watchdog,KillSwitch
-from .reconcile import Reconciler
-from .option_chain import OptionChain
-from .engine import DecisionPipeline,EngineContext
-from .instruments import InstrumentMaster
-from .routing import SmartOrderRouter
-from .eventbus import EventBus
-from .stream_manager import StreamManager
-from .readiness import ProductionReadiness
-from .order_monitor import OrderMonitor
-from .version import VERSION
-from .live_risk import snapshot_from_positions
-from .operator_auth import require_live_operator
+from pathlib import Path
+from typing import Literal, Optional
+
+from fastapi import Body, FastAPI, Header, WebSocket
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+
 from .audit_chain import PersistentAuditChain
+from .brokers import BrokerRegistry
+from .config import settings
 from .dashboard import build_dashboard_state
-feed=MarketDataGateway();ledger=Ledger();brokers=BrokerRegistry();audit_chain=PersistentAuditChain(ledger);watchdog=Watchdog();kill=KillSwitch();reconciler=Reconciler();chain=OptionChain();pipeline=DecisionPipeline();instruments=InstrumentMaster();router=SmartOrderRouter(brokers);bus=EventBus();stream_manager=None;order_monitor=None;readiness=None;ws_clients=set()
-async def handle_tick(t):
-    watchdog.beat();r=feed.ingest(t)
-    if r['accepted']:
-        chain.update(t);event={'type':'MARKET_TICK','tick':t.model_dump()};await emit_ui_event(event)
-    else: ledger.event('MARKET_TICK_REJECTED',{'tick':t.model_dump(),'reason':r.get('reason')})
-    return r
-async def emit_ui_event(event):
-    # UI delivery is non-authoritative telemetry. It must never change an order result.
-    try:
-        await bus.publish(event)
-    except Exception as exc:
-        ledger.event(event.get('type','EVENT'), event)
-        ledger.event('UI_EVENT_BUS_ERROR', {'type': event.get('type'), 'error': str(exc)})
-    for q in list(ws_clients):
+from .engine import DecisionPipeline
+from .eventbus import EventBus
+from .health_cache import HealthCache
+from .instruments import InstrumentMaster
+from .ledger import Ledger
+from .market import MarketDataGateway
+from .models import OrderRequest, Tick
+from .oms import OrderService
+from .operator_auth import require_control_operator, require_live_operator
+from .option_chain import OptionChain
+from .order_monitor import OrderMonitor
+from .readiness import ProductionReadiness
+from .reconcile import Reconciler
+from .risk_monitor import RiskMonitor
+from .routing import SmartOrderRouter
+from .security import SecurityMiddleware, origin_allowed
+from .stream_manager import StreamManager
+from .version import VERSION
+from .watchdog import KillSwitch, Watchdog
+
+
+class Terminal:
+    def __init__(self, brokers=None, ledger=None, data_dir=None):
+        self.settings = settings
+        self.ledger = ledger or Ledger()
+        self.audit = PersistentAuditChain(self.ledger)
+        self.brokers = brokers or BrokerRegistry()
+        self.health = HealthCache(self.brokers)
+        self.feed = MarketDataGateway()
+        self.watchdog = Watchdog(settings.watchdog_timeout_sec)
+        self.kill = KillSwitch(self.ledger, self.audit)
+        self.kill.load()
+        self.chain = OptionChain()
+        self.instruments = InstrumentMaster(data_dir)
+        self.pipeline = DecisionPipeline()
+        self.router = SmartOrderRouter(self.brokers, self.health)
+        self.reconciler = Reconciler()
+        self.bus = EventBus()
+        self.stream_manager = None
+        self.order_monitor = OrderMonitor(self.brokers, self.ledger, self.emit)
+        self.risk_monitor = RiskMonitor(self.brokers, self.feed, self.instruments, self.ledger, self.kill, self.emit)
+        self.oms = OrderService(self)
+        self.risk_monitor.executor = self.oms
+        self.readiness = ProductionReadiness(self.feed, self.health, self.watchdog, self.kill, self.instruments, None, self.ledger,
+                                             self.bus, self.risk_monitor, self.order_monitor)
+        self.ws_clients = set()
+        self.tasks = []
+        self._bus_error_at = 0.0
+
+    # ------------------------------------------------------------- events
+    async def emit(self, event):
+        """Fan an event out to Redis (durable copy) and dashboard sockets.
+        UI delivery is non-authoritative telemetry: it never changes an order result."""
         try:
-            q.put_nowait(event)
-        except asyncio.QueueFull:
+            await self.bus.publish(event)
+        except Exception as exc:  # noqa: BLE001
+            if time.time() - self._bus_error_at > 60:
+                self._bus_error_at = time.time()
+                self.ledger.event('UI_EVENT_BUS_ERROR', {'type': event.get('type'), 'error': str(exc)[:200]})
+        for q in list(self.ws_clients):
             try:
-                q.get_nowait()
-                q.put_nowait({'type':'UI_EVENT_DROPPED','reason':'CLIENT_QUEUE_FULL'})
                 q.put_nowait(event)
-            except Exception:
-                pass
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except Exception:  # noqa: BLE001
+                    pass
 
-async def audit_bus():
-    while True:
-        e=await bus.next();
-        if e.get('type') not in ('MARKET_TICK',):ledger.event(e.get('type','EVENT'),e)
-@asynccontextmanager
-async def lifespan(app):
-    global stream_manager,order_monitor,readiness
-    async def stream_event(e):
-        await emit_ui_event(e)
-    await bus.connect()
-    try:
-        import json as _json
-        urls=_json.loads(settings.instrument_master_urls_json or '{}')
-        for source,url in urls.items():
-            if url:
-                try: await instruments.load_url(url,source)
-                except Exception as exc: ledger.event('INSTRUMENT_MASTER_LOAD_ERROR',{'source':source,'error':str(exc)})
-    except Exception as exc:
-        ledger.event('INSTRUMENT_MASTER_CONFIG_ERROR',{'error':str(exc)})
-    persisted_kill=ledger.latest_kill()
-    if persisted_kill:
-        kill.trigger(str(persisted_kill.get('reason') or 'PERSISTED_KILL_SWITCH'))
-    stream_manager=StreamManager(handle_tick,stream_event,subscriptions=None)
-    readiness=ProductionReadiness(feed,brokers,watchdog,kill,instruments,stream_manager,ledger,bus)
-    await stream_manager.start();order_monitor=OrderMonitor(brokers,ledger);tasks=[asyncio.create_task(order_monitor.run(),name='order-monitor'),asyncio.create_task(audit_bus(),name='event-audit')]
-    yield
-    order_monitor.stop=True
-    for t in tasks:t.cancel()
-    await asyncio.gather(*tasks,return_exceptions=True);await stream_manager.stop()
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response=await call_next(request)
-        response.headers['X-Content-Type-Options']='nosniff'
-        response.headers['X-Frame-Options']='DENY'
-        response.headers['Referrer-Policy']='no-referrer'
-        response.headers['Cache-Control']='no-store'
-        return response
-app=FastAPI(title='Institutional Options Risk Terminal',version=VERSION,lifespan=lifespan)
-app.add_middleware(SecurityHeadersMiddleware)
-@app.get('/readyz')
-async def readyz():
-    r=await readiness.check() if readiness else {'ready':False,'reasons':['STARTING']}
-    return r
-@app.get('/health')
-async def health():
-    return {'status':'OK','market':'LIVE' if feed.live() else 'DATA_UNAVAILABLE','kill_switch':kill.triggered,'watchdog':watchdog.healthy(),
-            'live_trading':settings.live_trading,'auto_trading':settings.auto_trading_enabled,
-            'durable_event_bus':bool(getattr(bus,'redis_ok',False)),'brokers':await brokers.health(),'ledger':ledger.snapshot()}
+    async def handle_tick(self, t):
+        rec = self.instruments.get(t.broker, t.instrument_token)
+        if rec:
+            t = t.model_copy(update={'symbol': rec['symbol'] or t.symbol, 'exchange': rec['exchange'] or t.exchange,
+                                     'underlying': rec['underlying'], 'expiry': rec['expiry'], 'strike': rec['strike'],
+                                     'option_type': rec['option_type']})
+        r = self.feed.ingest(t)
+        if r['accepted']:
+            self.watchdog.beat()
+            self.chain.update(t)
+            await self.emit({'type': 'MARKET_TICK', 'tick': t.model_dump()})
+        return r
 
-@app.get('/dashboard/state')
-async def dashboard_state():
-    state=build_dashboard_state(feed=feed,brokers=brokers,ledger=ledger,watchdog=watchdog,kill=kill,bus=bus,
-                                stream_manager=stream_manager,order_monitor=order_monitor,readiness=readiness,
-                                chain=chain,instruments=instruments,settings=settings)
-    state['readiness']=await readiness.check() if readiness else {'ready':False,'reasons':['STARTING']}
-    return state
-
-@app.get('/dashboard/orders')
-def dashboard_orders(broker: str|None=None):
-    return {'orders':ledger.orders(broker)}
-
-@app.get('/dashboard/audit')
-def dashboard_audit(limit:int=100):
-    rows=ledger.audit_records(); return {'records':rows[-max(1,min(limit,1000)):], 'count':len(rows)}
-
-@app.post('/market/tick')
-async def tick(t:Tick, x_iort_internal: str|None=Header(default=None)):
-    # External tick injection is forbidden in live mode. Production ticks must
-    # originate from authenticated broker stream workers, not an HTTP caller.
-    if settings.live_trading:
-        return {'status':'BLOCKED','reason':'EXTERNAL_TICK_INGEST_DISABLED_IN_LIVE'}
-    return await handle_tick(t)
-@app.get('/option-chain/{exchange}/{underlying}/{expiry}')
-def oc(exchange,underlying,expiry):return {'summary':chain.summary(exchange,underlying,expiry),'rows':chain.snapshot(exchange,underlying,expiry)}
-def _decision(o,portfolio,approval_token_valid=False):
-    tok=str(o.instrument_token or '');cur=feed.last.get(tok);prev=feed.prev.get(tok)
-    if not cur:return {'approved':False,'agents':[],'proposal':{'action':'NO_TRADE','evidence':{'reason':'INSTRUMENT_DATA_UNAVAILABLE'}},'approval':{'approved':False,'reasons':['INSTRUMENT_DATA_UNAVAILABLE']},'risk':{'approved':False,'reasons':['INSTRUMENT_DATA_UNAVAILABLE']}}
-    pxchg=((cur.ltp-prev.ltp)/prev.ltp*100) if prev and prev.ltp else 0.0
-    spread_bps=((cur.ask-cur.bid)/cur.ltp*10000) if cur.ltp and cur.bid>0 and cur.ask>0 else 999999.0
-    m={'live':feed.live(o.broker) and feed.live_instrument(tok),'symbol':o.symbol,'order':o,'liquid':spread_bps<=settings.max_slippage_bps,
-       'flow':feed.flow(tok),'price_change_pct':pxchg,'iv_change_pct':0,'spread_bps':spread_bps,
-       'broker_reconciled':bool(portfolio.get('broker_reconciled')),'net_exposure':portfolio.get('net_exposure',0)}
-    ctx=EngineContext(market=m,portfolio=portfolio,broker_state={'reconciled':bool(portfolio.get('broker_reconciled'))},mode=o.mode.value)
-    return pipeline.evaluate(ctx,approval_token_valid)
-
-@app.post('/decision')
-def decision(o:OrderRequest,approval_token:str|None=None):
-    return {'status':'READINESS_REQUIRED','message':'Use /orders for broker-authoritative live evidence; /decision does not authorize live execution.'}
-@app.post('/orders')
-async def orders(o:OrderRequest, x_iort_operator_token: str|None=Header(default=None)):
-    operator_valid=require_live_operator(x_iort_operator_token)
-    if settings.live_trading and not operator_valid:
-        return {'status':'BLOCKED','reason':'OPERATOR_AUTH_REQUIRED'}
-    if kill.triggered:return {'status':'BLOCKED','reason':'KILL_SWITCH'}
-    if not settings.live_trading:return {'status':'BLOCKED','reason':'LIVE_TRADING_DISABLED'}
-    if o.mode.value=='AUTO' and not settings.auto_trading_enabled:
-        return {'status':'BLOCKED','reason':'AUTO_TRADING_DISABLED'}
-    if o.side not in ('BUY','SELL'):return {'status':'BLOCKED','reason':'INVALID_SIDE'}
-    if o.client_order_id:
-        existing=next((x for x in ledger.orders() if x.get('client_order_id')==o.client_order_id),None)
-        if existing:return {'status':'IDEMPOTENT_REPLAY','order':existing}
-    selected_broker,route_meta=await router.select(o.broker,feed) if settings.smart_routing_enabled else (o.broker.upper(),{'mode':'DISABLED'})
-    if not selected_broker:return {'status':'BLOCKED','reason':'NO_HEALTHY_ROUTE','routing':route_meta}
-    if selected_broker!=o.broker.upper():
-        o=o.model_copy(update={'broker':selected_broker})
-    if o.qty<=0 or o.qty>settings.max_position_qty:return {'status':'BLOCKED','reason':'POSITION_LIMIT'}
-    if o.order_type!='MARKET' and (o.price is None or o.price<=0):return {'status':'BLOCKED','reason':'LIMIT_PRICE_REQUIRED'}
-    estimated_px=o.price
-    if estimated_px is None:
-        cur=feed.last.get(str(o.instrument_token or ''))
-        estimated_px=cur.ltp if cur else None
-    if estimated_px is None or estimated_px<=0:
-        return {'status':'BLOCKED','reason':'MARKET_PRICE_EVIDENCE_UNAVAILABLE'}
-    if estimated_px*o.qty>settings.max_order_value:
-        return {'status':'BLOCKED','reason':'ORDER_VALUE_LIMIT','estimated_value':estimated_px*o.qty}
-    cur_for_slippage=feed.last.get(str(o.instrument_token or ''))
-    if cur_for_slippage and cur_for_slippage.ltp>0 and cur_for_slippage.bid>0 and cur_for_slippage.ask>0:
-        spread_bps=(cur_for_slippage.ask-cur_for_slippage.bid)/cur_for_slippage.ltp*10000
-        if spread_bps>settings.max_slippage_bps:
-            return {'status':'BLOCKED','reason':'SLIPPAGE_LIMIT','spread_bps':spread_bps}
-    if not o.instrument_token:return {'status':'BLOCKED','reason':'INSTRUMENT_TOKEN_REQUIRED'}
-    if settings.require_instrument_master and not instruments.find(token=o.instrument_token):
-        return {'status':'BLOCKED','reason':'INSTRUMENT_MASTER_TOKEN_NOT_FOUND'}
-    gate=await readiness.check(o.broker,o.instrument_token)
-    if not gate['ready']: return {'status':'BLOCKED','reason':'PRODUCTION_READINESS_FAILED','readiness':gate}
-    try:
-        broker=brokers.get(o.broker)
-        remote_positions=await broker.positions()
-        remote_margin=await broker.margin()
-        snap=snapshot_from_positions(o.broker,remote_positions,remote_margin, {str(k):v.ltp for k,v in feed.last.items()})
-        recon=await reconciler.reconcile(broker,ledger)
-        if not recon.get('ok'):return {'status':'BLOCKED','reason':'BROKER_RECONCILIATION_REQUIRED','reconciliation':recon}
-        if settings.require_margin_evidence and snap.margin_pct is None:
-            return {'status':'BLOCKED','reason':'MARGIN_EVIDENCE_UNAVAILABLE'}
-        if snap.net_pnl<=-settings.portfolio_hard_sl:
-            kill.trigger('HARD_PORTFOLIO_STOP');ledger.event('KILL_SWITCH',{'reason':'HARD_PORTFOLIO_STOP'});audit_chain.append('KILL_SWITCH','RISK_ENGINE',{'reason':'HARD_PORTFOLIO_STOP'})
-            return {'status':'BLOCKED','reason':'HARD_PORTFOLIO_STOP','net_pnl':snap.net_pnl}
-        if snap.net_pnl<=-settings.portfolio_soft_sl:return {'status':'BLOCKED','reason':'SOFT_PORTFOLIO_STOP','net_pnl':snap.net_pnl}
-        if snap.daily_pnl is None and settings.max_daily_loss > 0:
-            return {'status':'BLOCKED','reason':'DAILY_PNL_EVIDENCE_UNAVAILABLE'}
-        if snap.daily_pnl is not None and snap.daily_pnl<=-settings.max_daily_loss:
-            return {'status':'BLOCKED','reason':'DAILY_LOSS_LIMIT','daily_pnl':snap.daily_pnl}
-        if snap.exposure>settings.max_net_exposure:return {'status':'BLOCKED','reason':'NET_EXPOSURE_LIMIT','exposure':snap.exposure}
-        portfolio={'net_pnl':snap.net_pnl,'daily_pnl':snap.daily_pnl if snap.daily_pnl is not None else 0,'margin_pct':snap.margin_pct if snap.margin_pct is not None else 999999,
-                   'slippage_bps':0,'net_exposure':snap.exposure,'broker_reconciled':True,'risk_blocked':False}
-        if settings.require_scenario_risk:
-            rows=[]
-            for p in (remote_positions.get('data',[]) if isinstance(remote_positions,dict) else remote_positions or []):
-                if not isinstance(p,dict): continue
-                rows.append({'qty':p.get('quantity',p.get('net_quantity',0)),'lot_size':p.get('lot_size',1),'spot':p.get('spot',p.get('last_price',0)),
-                             'delta':p.get('delta',0),'gamma':p.get('gamma',0),'vega':p.get('vega',0),'theta':p.get('theta',0)})
-            if not rows:
-                return {'status':'BLOCKED','reason':'SCENARIO_RISK_EVIDENCE_UNAVAILABLE'}
-            scen=scenario_risk.run(rows)
-            scenario_gate=pretrade_portfolio.assess({'delta_impact':0,'vega_impact':0},portfolio,scen,{'max_scenario_loss':settings.max_scenario_loss,'max_abs_delta':settings.max_abs_delta,'max_vega':settings.max_abs_vega})
-            if not scenario_gate['approved']: return {'status':'BLOCKED','reason':'SCENARIO_RISK_LIMIT','details':scenario_gate}
-        d=_decision(o,portfolio,operator_valid)
-        if not d['approved']:return {'status':'BLOCKED','decision':d}
-        client_id=o.client_order_id or str(uuid.uuid4());req=o.model_dump();req['client_order_id']=client_id
-        result=await router.route(req)
-        status=result.get('status','UNKNOWN')
-        ledger.upsert_order({'client_order_id':client_id,'broker':o.broker,'exchange':o.exchange,'symbol':o.symbol,'side':o.side,'qty':o.qty,
-                             'status':status,'broker_order_id':result.get('broker_order_id'),'filled_qty':0,'avg_price':0})
-        payload={'client_order_id':client_id,'result':result,'portfolio':portfolio,'decision':d,'routing':route_meta}
-        ledger.event('ORDER_SUBMISSION',payload); audit_chain.append('ORDER_SUBMISSION', 'OPERATOR' if operator_valid else 'SYSTEM', {'client_order_id':client_id,'broker':o.broker,'status':status})
-        await emit_ui_event({'type':'ORDER_SUBMISSION','payload':payload})
-        return {'client_order_id':client_id,**result}
-    except Exception as e:
-        # LIVE_RISK_SNAPSHOT_FAILED is intentionally fail-closed; no order is submitted.
-        ledger.event('ORDER_GATE_ERROR',{'broker':o.broker,'error':str(e)})
-        return {'status':'BLOCKED','reason':'LIVE_RISK_EVIDENCE_FAILED','error':str(e)}
-
-@app.post('/kill')
-async def ks(reason='MANUAL_PANIC', x_iort_operator_token: str|None=Header(default=None)):
-    if settings.live_trading and not require_live_operator(x_iort_operator_token):
-        return {'status':'BLOCKED','reason':'OPERATOR_AUTH_REQUIRED'}
-    kill.trigger(reason);payload={'reason':reason};ledger.event('KILL_SWITCH',payload);audit_chain.append('KILL_SWITCH','OPERATOR',payload);await emit_ui_event({'type':'KILL_SWITCH','payload':payload});return {'status':'TRIGGERED','reason':reason}
-
-@app.post('/emergency-stop/{broker}')
-async def emergency_stop(broker:str, flatten:bool=False, x_iort_operator_token: str|None=Header(default=None)):
-    if not require_live_operator(x_iort_operator_token):
-        return {'status':'BLOCKED','reason':'OPERATOR_AUTH_REQUIRED'}
-    kill.trigger('EMERGENCY_STOP')
-    b=brokers.get(broker.upper())
-    result={'broker':broker.upper(),'kill_switch':True}
-    try:
-        result['cancel']=await b.cancel_all()
-        if flatten:
-            if not settings.emergency_flatten_enabled:return {'status':'BLOCKED','reason':'EMERGENCY_FLATTEN_DISABLED'}
-            result['flatten']='NOT_AUTOMATED_IN_THIS_BUILD'
-        ledger.event('EMERGENCY_STOP',result)
-        return {'status':'TRIGGERED',**result}
-    except Exception as e:
-        ledger.event('EMERGENCY_STOP_ERROR',{'broker':broker,'error':str(e)})
-        return {'status':'TRIGGERED_WITH_ERRORS','broker':broker.upper(),'error':str(e)}
-@app.post('/reconcile/{broker}')
-async def reconcile(broker:str, x_iort_operator_token: str|None=Header(default=None)):
-    if settings.live_trading and not require_live_operator(x_iort_operator_token):
-        return {'status':'BLOCKED','reason':'OPERATOR_AUTH_REQUIRED'}
-    result=await reconciler.reconcile(brokers.get(broker),ledger)
-    await emit_ui_event({'type':'RECONCILIATION','broker':broker.upper(),'payload':result})
-    return result
-
-@app.websocket('/ws/events')
-async def ws(w:WebSocket):
-    await w.accept();q=asyncio.Queue(maxsize=256);ws_clients.add(q)
-    try:
-        await w.send_json({'type':'STATE','market':'LIVE' if feed.live() else 'DATA_UNAVAILABLE','watchdog':watchdog.healthy(),'kill_switch':kill.triggered})
+    # ---------------------------------------------------------- lifecycle
+    async def _drain_bus(self):
         while True:
-            try:event=await asyncio.wait_for(q.get(),timeout=2);await w.send_json(event)
-            except asyncio.TimeoutError: await w.send_json({'type':'HEARTBEAT','market':'LIVE' if feed.live() else 'DATA_UNAVAILABLE','watchdog':watchdog.healthy(),'kill_switch':kill.triggered})
-    except Exception: pass
-    finally: ws_clients.discard(q)
+            await self.bus.next()
 
-@app.get('/ops/metrics')
-def ops_metrics(): return {'version':VERSION,'market_live':feed.live(),'rejected_ticks':len(feed.rejected),'ledger':ledger.snapshot(),'watchdog':watchdog.healthy(),'kill_switch':kill.triggered,'stream_workers':[w.broker for w in (stream_manager.workers if stream_manager else [])]}
-@app.get('/')
-def dashboard():return FileResponse('/app/frontend/index.html')
+    async def _reconcile_loop(self):
+        while True:
+            for b in self.brokers.configured():
+                try:
+                    await self.reconciler.reconcile(b, self.ledger)
+                except Exception as exc:  # noqa: BLE001
+                    self.ledger.event('RECONCILE_LOOP_ERROR', {'broker': b.name, 'error': str(exc)[:200]})
+            await asyncio.sleep(settings.reconcile_interval_sec)
 
-# Institutional benchmark analytics (v2.2)
-from .benchmark import VolSurfaceEngine,ScenarioRiskEngine,PortfolioGreeks,PreTradePortfolioRisk,SelfTradePrevention,AutoHedger,AlgoOrderPlanner,ExecutionTCA,HAReadiness
-vol_surface=VolSurfaceEngine(); scenario_risk=ScenarioRiskEngine(); portfolio_greeks=PortfolioGreeks(); pretrade_portfolio=PreTradePortfolioRisk(); stp=SelfTradePrevention(); autohedger=AutoHedger(); algo_planner=AlgoOrderPlanner(); tca=ExecutionTCA(); ha=HAReadiness()
-@app.post('/analytics/vol-surface')
-def analytics_vol_surface(payload:dict):
-    from .benchmark import VolPoint
-    pts=[VolPoint(float(x['strike']),float(x['iv']),float(x.get('weight',1))) for x in payload.get('points',[])]
-    return vol_surface.fit_smile(float(payload.get('spot',0)),pts)
-@app.post('/risk/scenarios')
-def risk_scenarios(payload:dict):return scenario_risk.run(payload.get('positions',[]),tuple(payload.get('spot_shocks',[-.05,0,.05])),tuple(payload.get('vol_shocks',[-.10,0,.10])),float(payload.get('days',1)))
-@app.post('/risk/portfolio-greeks')
-def risk_portfolio_greeks(payload:dict):return portfolio_greeks.aggregate(payload.get('positions',[]))
-@app.post('/risk/pretrade-portfolio')
-def risk_pretrade(payload:dict):return pretrade_portfolio.assess(payload.get('order',{}),payload.get('portfolio',{}),payload.get('scenarios',{}),payload.get('limits',{}))
-@app.post('/risk/self-trade-check')
-def risk_self_trade(payload:dict):return stp.check(payload.get('order',{}),payload.get('working_orders',[]))
-@app.post('/hedge/delta')
-def hedge_delta(payload:dict):return autohedger.delta_hedge(float(payload.get('net_delta',0)),float(payload.get('hedge_delta',0)),int(payload.get('lot_size',1)))
-@app.post('/algo/iceberg')
-def algo_iceberg(payload:dict):return algo_planner.iceberg(int(payload.get('qty',0)),int(payload.get('disclosed',0)))
-@app.post('/algo/twap')
-def algo_twap(payload:dict):return algo_planner.twap(int(payload.get('qty',0)),int(payload.get('slices',0)),int(payload.get('start_ms',0)),int(payload.get('end_ms',0)))
-@app.post('/analytics/tca')
-def analytics_tca(payload:dict):return tca.summarize(payload.get('fills',[]),float(payload.get('arrival_price',0)),str(payload.get('side','BUY')))
-@app.post('/ops/ha-readiness')
-def ops_ha(payload:dict):return ha.assess(payload)
-from .enterprise_controls import RBAC,ComplianceGuard,TamperEvidentAudit,HealthBudget,DRRunbook
-rbac=RBAC(); compliance=ComplianceGuard(); tamper_audit=TamperEvidentAudit(); health_budget=HealthBudget(); dr_runbook=DRRunbook()
-@app.get('/enterprise/readiness')
-def enterprise_readiness():
-    return health_budget.assess({'database':ledger.snapshot() is not None,'event_bus':bus is not None,'stream_manager':stream_manager is not None,'order_monitor':order_monitor is not None,'broker_registry':brokers is not None})
-@app.post('/enterprise/compliance-check')
-def enterprise_compliance(payload:dict, x_iort_operator_token: str|None=Header(default=None)):
-    if settings.live_trading and not require_live_operator(x_iort_operator_token):
-        return {'approved':False,'reasons':['OPERATOR_AUTH_REQUIRED']}
-    return compliance.validate(payload.get('order',{}),role=payload.get('role','TRADER'),kill=kill.triggered,live=settings.live_trading)
-@app.post('/enterprise/dr-failover')
-def enterprise_dr(payload:dict, x_iort_operator_token: str|None=Header(default=None)):
-    if settings.live_trading and not require_live_operator(x_iort_operator_token):
-        return {'status':'BLOCKED','reason':'OPERATOR_AUTH_REQUIRED'}
-    return dr_runbook.failover(bool(payload.get('primary_ok')),bool(payload.get('secondary_ok')))
-@app.post('/enterprise/audit')
-def enterprise_audit(payload:dict, x_iort_operator_token: str|None=Header(default=None)):
-    if settings.live_trading and not require_live_operator(x_iort_operator_token):
-        return {'status':'BLOCKED','reason':'OPERATOR_AUTH_REQUIRED'}
-    return {'hash':audit_chain.append(str(payload.get('action','UNKNOWN')),str(payload.get('actor','SYSTEM')),payload.get('payload',{}))}
-@app.get('/enterprise/audit/verify')
-def enterprise_audit_verify(): return audit_chain.verify()
+    async def start(self):
+        await self.bus.connect()
+        try:
+            urls = json.loads(settings.instrument_master_urls_json or '{}')
+        except ValueError as exc:
+            urls = {}
+            self.ledger.event('INSTRUMENT_MASTER_CONFIG_ERROR', {'error': str(exc)})
+        for broker, url in urls.items():
+            if url:
+                try:
+                    await self.instruments.load_url(url, broker)
+                except Exception as exc:  # noqa: BLE001
+                    self.ledger.event('INSTRUMENT_MASTER_LOAD_ERROR', {'broker': broker, 'error': str(exc)[:300]})
+        self.stream_manager = StreamManager(self.handle_tick, self.emit, registry=self.brokers)
+        self.readiness.stream_manager = self.stream_manager
+        await self.stream_manager.start()
+        for name, coro in (('order-monitor', self.order_monitor.run()), ('risk-monitor', self.risk_monitor.run()),
+                           ('reconcile', self._reconcile_loop()), ('bus-drain', self._drain_bus())):
+            self.tasks.append(asyncio.create_task(coro, name=name))
+
+    async def stop(self):
+        self.order_monitor.stop = True
+        self.risk_monitor.stop = True
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        if self.stream_manager:
+            await self.stream_manager.stop()
+        await self.brokers.aclose()
+        await self.bus.close()
+
+
+class ResolveRequest(BaseModel):
+    status: Literal['REJECTED', 'CANCELLED', 'FILLED', 'EXPIRED']
+    reason: str = Field(min_length=3, max_length=300)
+    broker_order_id: Optional[str] = None
+
+
+def _frontend():
+    here = Path(__file__).resolve()
+    for p in (here.parents[1] / 'frontend' / 'index.html', here.parents[2] / 'frontend' / 'index.html'):
+        if p.exists():
+            return p
+    return None
+
+
+def create_app(t: Terminal, run_background=True):
+    @asynccontextmanager
+    async def lifespan(app):
+        if run_background:
+            await t.start()
+        yield
+        if run_background:
+            await t.stop()
+
+    app = FastAPI(title='Institutional Options Risk Terminal', version=VERSION, lifespan=lifespan)
+    app.add_middleware(SecurityMiddleware)
+    app.state.terminal = t
+
+    def denied():
+        return JSONResponse({'status': 'BLOCKED', 'reason': 'OPERATOR_AUTH_REQUIRED'}, status_code=401)
+
+    def broker_or_404(name):
+        try:
+            return t.brokers.get(name)
+        except KeyError:
+            return None
+
+    @app.get('/readyz')
+    async def readyz():
+        return await t.readiness.check()
+
+    @app.get('/health')
+    async def health():
+        return {'status': 'OK', 'version': VERSION, 'market': 'LIVE' if t.feed.live() else 'DATA_UNAVAILABLE',
+                'kill_switch': t.kill.triggered, 'watchdog': t.watchdog.healthy(), 'live_trading': settings.live_trading,
+                'auto_trading': settings.auto_trading_enabled, 'durable_event_bus': t.bus.redis_ok,
+                'brokers': await t.health.get(), 'ledger': t.ledger.snapshot()}
+
+    @app.get('/dashboard/state')
+    async def dashboard_state():
+        return await build_dashboard_state(t)
+
+    @app.get('/dashboard/orders')
+    def dashboard_orders(broker: Optional[str] = None, limit: int = 200):
+        return {'orders': t.ledger.orders(broker, limit=max(1, min(limit, 5000)))}
+
+    @app.get('/dashboard/audit')
+    def dashboard_audit(limit: int = 100):
+        rows = t.ledger.audit_records()
+        return {'records': rows[-max(1, min(limit, 1000)):], 'count': len(rows)}
+
+    @app.get('/risk/snapshot')
+    def risk_snapshot():
+        return {'aggregate': t.risk_monitor.aggregate(), 'last_eval': t.risk_monitor.last_eval,
+                'snapshots': {b: s.to_dict() for b, s in t.risk_monitor.snapshots.items()}}
+
+    @app.post('/market/tick')
+    async def tick(tk: Tick):
+        # Production ticks come only from authenticated broker streams.
+        if settings.live_trading:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'EXTERNAL_TICK_INGEST_DISABLED_IN_LIVE'}, status_code=403)
+        return await t.handle_tick(tk)
+
+    @app.get('/option-chain/{exchange}/{underlying}/{expiry}')
+    def option_chain(exchange: str, underlying: str, expiry: str):
+        return {'summary': t.chain.summary(exchange, underlying, expiry), 'rows': t.chain.snapshot(exchange, underlying, expiry)}
+
+    @app.post('/decision')
+    def decision(o: OrderRequest):
+        return {'status': 'READINESS_REQUIRED', 'message': 'Use /orders; /decision does not authorize live execution.'}
+
+    @app.post('/orders')
+    async def orders(o: OrderRequest, x_iort_operator_token: Optional[str] = Header(default=None)):
+        return await t.oms.submit(o, require_live_operator(x_iort_operator_token))
+
+    @app.get('/orders/{client_order_id}')
+    def get_order(client_order_id: str):
+        o = t.ledger.get_order(client_order_id)
+        if not o:
+            return JSONResponse({'status': 'NOT_FOUND'}, status_code=404)
+        return {'order': o, 'fills': t.ledger.fills_for(client_order_id)}
+
+    @app.post('/orders/{client_order_id}/resolve')
+    def resolve_order(client_order_id: str, body: ResolveRequest, x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Operator resolution of an ambiguous order after checking the broker terminal."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        o = t.ledger.get_order(client_order_id)
+        if not o or o['status'] not in ('UNKNOWN', 'PENDING_SUBMIT'):
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'ORDER_NOT_AMBIGUOUS'}, status_code=409)
+        applied, prev = t.ledger.transition(client_order_id, body.status, reason='OPERATOR:' + body.reason,
+                                            broker_order_id=body.broker_order_id)
+        t.audit.append('ORDER_RESOLVED', 'OPERATOR', {'client_order_id': client_order_id, 'from': prev, 'to': body.status,
+                                                      'reason': body.reason})
+        return {'status': 'RESOLVED' if applied else 'REJECTED_TRANSITION', 'from': prev, 'to': body.status}
+
+    @app.post('/kill')
+    async def kill(reason: str = 'MANUAL_PANIC', x_iort_operator_token: Optional[str] = Header(default=None)):
+        if settings.live_trading and not require_live_operator(x_iort_operator_token):
+            return denied()
+        t.kill.trigger(reason, 'OPERATOR')
+        await t.emit({'type': 'KILL_SWITCH', 'payload': t.kill.state()})
+        return {'status': 'TRIGGERED', **t.kill.state()}
+
+    @app.post('/kill/reset')
+    async def kill_reset(reason: str, x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        if len(reason.strip()) < 3:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'RESET_REASON_REQUIRED'}, status_code=400)
+        t.kill.reset('OPERATOR', reason)
+        await t.emit({'type': 'KILL_SWITCH_RESET', 'payload': t.kill.state()})
+        return {'status': 'RESET', **t.kill.state()}
+
+    @app.post('/emergency-stop/{broker}')
+    async def emergency_stop(broker: str, flatten: bool = False, x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        b = broker_or_404(broker)
+        if b is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        if flatten and not settings.emergency_flatten_enabled:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'EMERGENCY_FLATTEN_DISABLED'}, status_code=400)
+        t.kill.trigger('EMERGENCY_STOP', 'OPERATOR')  # persisted: survives restart (original did not persist it)
+        result = {'broker': b.name, 'kill_switch': True}
+        try:
+            result['cancel'] = await b.cancel_all()
+        except Exception as exc:  # noqa: BLE001
+            result['cancel'] = {'status': 'CANCEL_ALL_FAILED', 'error': str(exc)[:200]}
+        if flatten:
+            result['flatten'] = await t.oms.flatten_broker(b, 'OPERATOR')
+        t.ledger.event('EMERGENCY_STOP', result)
+        t.audit.append('EMERGENCY_STOP', 'OPERATOR', {'broker': b.name, 'flatten': flatten})
+        await t.emit({'type': 'EMERGENCY_STOP', 'payload': result})
+        return {'status': 'TRIGGERED', **result}
+
+    @app.post('/flatten/{broker}')
+    async def flatten(broker: str, x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        if not settings.emergency_flatten_enabled:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'EMERGENCY_FLATTEN_DISABLED'}, status_code=400)
+        b = broker_or_404(broker)
+        if b is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        return await t.oms.flatten_broker(b, 'OPERATOR')
+
+    @app.post('/reconcile/{broker}')
+    async def reconcile(broker: str, x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        b = broker_or_404(broker)
+        if b is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        result = await t.reconciler.reconcile(b, t.ledger)
+        await t.emit({'type': 'RECONCILIATION', 'broker': b.name, 'payload': result})
+        return result
+
+    @app.post('/instruments/load/{broker}')
+    async def load_instruments(broker: str, url: str = Body(embed=True), x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        if broker_or_404(broker) is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        return await t.instruments.load_url(url, broker)
+
+    @app.websocket('/ws/events')
+    async def ws(w: WebSocket):
+        if not origin_allowed(w.headers.get('origin'), w.headers.get('host')):
+            await w.close(code=1008)
+            return
+        await w.accept()
+        q = asyncio.Queue(maxsize=256)
+        t.ws_clients.add(q)
+        try:
+            await w.send_json({'type': 'STATE', 'market': 'LIVE' if t.feed.live() else 'DATA_UNAVAILABLE',
+                               'watchdog': t.watchdog.healthy(), 'kill_switch': t.kill.triggered})
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=2)
+                    await w.send_json(event)
+                except asyncio.TimeoutError:
+                    await w.send_json({'type': 'HEARTBEAT', 'market': 'LIVE' if t.feed.live() else 'DATA_UNAVAILABLE',
+                                       'watchdog': t.watchdog.healthy(), 'kill_switch': t.kill.triggered})
+        except Exception:  # noqa: BLE001 - client went away
+            pass
+        finally:
+            t.ws_clients.discard(q)
+
+    @app.get('/ops/metrics')
+    def ops_metrics():
+        return {'version': VERSION, 'market_live': t.feed.live(), 'feed': t.feed.stats(), 'ledger': t.ledger.snapshot(),
+                'watchdog': t.watchdog.healthy(), 'kill_switch': t.kill.triggered,
+                'stream_workers': t.stream_manager.status() if t.stream_manager else []}
+
+    @app.get('/')
+    def dashboard():
+        p = _frontend()
+        return FileResponse(p) if p else JSONResponse({'status': 'FRONTEND_NOT_PACKAGED'}, status_code=404)
+
+    _register_calculators(app, t)
+    return app
+
+
+def _register_calculators(app, t):
+    """Stateless analytics calculators. They do not touch orders or broker state."""
+    from .benchmark import (AlgoOrderPlanner, AutoHedger, ExecutionTCA, HAReadiness, PortfolioGreeks, PreTradePortfolioRisk,
+                            ScenarioRiskEngine, SelfTradePrevention, VolPoint, VolSurfaceEngine)
+    from .enterprise_controls import ComplianceGuard, DRRunbook, HealthBudget
+    from .scenario import revalue
+    vol, scen, greeks, pre = VolSurfaceEngine(), ScenarioRiskEngine(), PortfolioGreeks(), PreTradePortfolioRisk()
+    stp, hedger, algo, tca, ha = SelfTradePrevention(), AutoHedger(), AlgoOrderPlanner(), ExecutionTCA(), HAReadiness()
+    compliance, dr, budget = ComplianceGuard(), DRRunbook(), HealthBudget()
+
+    app.post('/analytics/vol-surface')(lambda payload=Body(...): vol.fit_smile(
+        float(payload.get('spot', 0)), [VolPoint(float(x['strike']), float(x['iv']), float(x.get('weight', 1))) for x in payload.get('points', [])]))
+    app.post('/risk/scenarios')(lambda payload=Body(...): scen.run(
+        payload.get('positions', []), tuple(payload.get('spot_shocks', [-.05, 0, .05])),
+        tuple(payload.get('vol_shocks', [-.10, 0, .10])), float(payload.get('days', 1))))
+    app.post('/risk/scenarios/full')(lambda payload=Body(...): revalue(payload.get('positions', []), payload.get('spots', {})))
+    app.post('/risk/portfolio-greeks')(lambda payload=Body(...): greeks.aggregate(payload.get('positions', [])))
+    app.post('/risk/pretrade-portfolio')(lambda payload=Body(...): pre.assess(
+        payload.get('order', {}), payload.get('portfolio', {}), payload.get('scenarios', {}), payload.get('limits', {})))
+    app.post('/risk/self-trade-check')(lambda payload=Body(...): stp.check(payload.get('order', {}), payload.get('working_orders', [])))
+    app.post('/hedge/delta')(lambda payload=Body(...): hedger.delta_hedge(
+        float(payload.get('net_delta', 0)), float(payload.get('hedge_delta', 0)), int(payload.get('lot_size', 1))))
+    app.post('/algo/iceberg')(lambda payload=Body(...): algo.iceberg(int(payload.get('qty', 0)), int(payload.get('disclosed', 0))))
+    app.post('/algo/twap')(lambda payload=Body(...): algo.twap(int(payload.get('qty', 0)), int(payload.get('slices', 0)),
+                                                              int(payload.get('start_ms', 0)), int(payload.get('end_ms', 0))))
+    app.post('/analytics/tca')(lambda payload=Body(...): tca.summarize(payload.get('fills', []), float(payload.get('arrival_price', 0)),
+                                                                      str(payload.get('side', 'BUY'))))
+    app.post('/ops/ha-readiness')(lambda payload=Body(...): ha.assess(payload))
+    app.get('/enterprise/readiness')(lambda: budget.assess({'database': True, 'event_bus': t.bus is not None,
+                                                            'stream_manager': t.stream_manager is not None,
+                                                            'order_monitor': not t.order_monitor.stop, 'risk_monitor': not t.risk_monitor.stop}))
+
+    @app.post('/enterprise/compliance-check')
+    def enterprise_compliance(payload: dict = Body(...)):
+        # Calculator only: role comes from the caller and is NOT an authorization decision.
+        return compliance.validate(payload.get('order', {}), role=payload.get('role', 'TRADER'), kill=t.kill.triggered,
+                                   live=settings.live_trading)
+
+    @app.post('/enterprise/dr-failover')
+    def enterprise_dr(payload: dict = Body(...), x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'OPERATOR_AUTH_REQUIRED'}, status_code=401)
+        return dr.failover(bool(payload.get('primary_ok')), bool(payload.get('secondary_ok')))
+
+    @app.post('/enterprise/audit')
+    def enterprise_audit(payload: dict = Body(...), x_iort_operator_token: Optional[str] = Header(default=None)):
+        if not require_control_operator(x_iort_operator_token):
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'OPERATOR_AUTH_REQUIRED'}, status_code=401)
+        return {'hash': t.audit.append(str(payload.get('action', 'UNKNOWN')), 'OPERATOR', payload.get('payload', {}))}
+
+    app.get('/enterprise/audit/verify')(lambda: t.audit.verify())
+
+
+terminal = Terminal()
+app = create_app(terminal)

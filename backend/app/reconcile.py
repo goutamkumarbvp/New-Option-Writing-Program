@@ -1,27 +1,98 @@
+"""Broker reconciliation, scoped to the current IST trading day.
+
+Broker order books contain only today's orders. The original compared every
+order ever written to the ledger against today's book, so from the second
+trading day onward every historical order became MISSING_REMOTE_ORDER and all
+trading was blocked permanently.
+"""
+import time
+from datetime import datetime
+
+from .clock import trading_date
+from .normalize import TERMINAL
+
+
 class Reconciler:
-    def _items(self,x):return x.get('data',[]) if isinstance(x,dict) else (x or [])
-    def _bo(self,o):return str(o.get('order_id') or o.get('orderId') or o.get('nOrdNo') or o.get('order_no') or '')
-    async def reconcile(self,broker,ledger):
-        positions=self._items(await broker.positions());orders=self._items(await broker.orders());m=[]
-        local=ledger.orders(broker.name); local_by={str(x['broker_order_id']):x for x in local if x.get('broker_order_id')}
-        remote_by={self._bo(o):o for o in orders if isinstance(o,dict) and self._bo(o)}
-        # Import broker-side/manual orders into the ledger as EXTERNAL orders before
-        # comparing. This prevents a pre-existing manual order from being mistaken
-        # for data loss while still making it visible to risk/reconciliation.
-        for bo,ro in remote_by.items():
-            if bo not in local_by:
-                ledger.upsert_order({'client_order_id':f'EXTERNAL-{broker.name}-{bo}','broker_order_id':bo,'broker':broker.name,
-                                     'exchange':ro.get('exchange') or ro.get('exchange_segment') or '',
-                                     'symbol':ro.get('tradingsymbol') or ro.get('trading_symbol') or ro.get('symbol') or '',
-                                     'side':ro.get('transaction_type') or ro.get('transactionType') or ro.get('trnsTp') or '',
-                                     'qty':int(ro.get('quantity',ro.get('qty',0)) or 0),'filled_qty':int(ro.get('filled_quantity',ro.get('filledQty',0)) or 0),
-                                     'status':str(ro.get('status') or ro.get('orderStatus') or ro.get('order_status') or 'UNKNOWN').upper(),
-                                     'avg_price':float(ro.get('average_price',ro.get('avgPrice',ro.get('avg_price',0))) or 0),'raw':ro})
-        local=ledger.orders(broker.name); local_by={str(x['broker_order_id']):x for x in local if x.get('broker_order_id')}
-        for bo,lo in local_by.items():
-            if bo not in remote_by:m.append({'type':'MISSING_REMOTE_ORDER','broker_order_id':bo})
-        for p in positions:
-            if not isinstance(p,dict):continue
-            symbol=p.get('symbol') or p.get('tradingsymbol') or p.get('trading_symbol');qty=p.get('quantity',p.get('net_quantity',p.get('netQty')))
-            if symbol is not None and qty is not None:ledger.upsert_position({'broker':broker.name,'exchange':p.get('exchange',p.get('exchange_segment','')),'symbol':symbol,'qty':int(qty or 0),'avg_price':float(p.get('average_price',p.get('avgPrice',0)) or 0),'pnl':float(p.get('pnl',0) or 0)})
-        result={'ok':not m,'positions_count':len(positions),'orders_count':len(orders),'mismatches':m,'broker':broker.name};ledger.record_reconciliation(broker.name,result['ok'],m);ledger.event('BROKER_RECONCILIATION',result);return result
+    def __init__(self, grace_sec=30):
+        self.grace_sec = grace_sec
+
+    @staticmethod
+    def _age(o):
+        try:
+            return time.time() - datetime.fromisoformat(o['created_at']).timestamp()
+        except Exception:  # noqa: BLE001
+            return float('inf')
+
+    async def reconcile(self, broker, ledger):
+        today = trading_date()
+        try:
+            remote = await broker.orders()
+        except Exception as exc:  # noqa: BLE001
+            result = {'ok': False, 'broker': broker.name, 'error': f'ORDER_BOOK_UNAVAILABLE:{str(exc)[:160]}', 'mismatches': []}
+            ledger.record_reconciliation(broker.name, False, [result['error']])
+            return result
+        by_id = {o['broker_order_id']: o for o in remote}
+        by_tag = {o['tag']: o for o in remote if o.get('tag')}
+        mismatches, resolved, expired, imported = [], [], [], []
+
+        # 1. Resolve ambiguous submissions (UNKNOWN / crashed PENDING_SUBMIT) by id or tag.
+        for lo in ledger.ambiguous_orders(broker.name):
+            ro = by_id.get(lo['broker_order_id']) if lo['broker_order_id'] else None
+            ro = ro or by_tag.get(lo['tag'])
+            if ro:
+                status = ro['status'] if ro['status'] != 'UNKNOWN' else 'SUBMITTED'
+                ledger.transition(lo['client_order_id'], status, reason='RESOLVED_BY_RECONCILIATION',
+                                  broker_order_id=ro['broker_order_id'], filled_qty=ro['filled_qty'], avg_price=ro['avg_price'] or None)
+                resolved.append(lo['client_order_id'])
+            elif lo['trading_date'] != today:
+                ledger.transition(lo['client_order_id'], 'EXPIRED', reason='AMBIGUOUS_PREVIOUS_SESSION_DAY_ORDER')
+                expired.append(lo['client_order_id'])
+            elif self._age(lo) > self.grace_sec:
+                ledger.transition(lo['client_order_id'], 'REJECTED', reason='NOT_IN_BROKER_ORDER_BOOK_AFTER_GRACE')
+                resolved.append(lo['client_order_id'])
+            else:
+                mismatches.append({'type': 'AMBIGUOUS_ORDER_PENDING', 'client_order_id': lo['client_order_id']})
+
+        # 2. Import broker-side orders this terminal did not place.
+        for ro in remote:
+            if not ledger.order_by_broker_id(broker.name, ro['broker_order_id']) and not ledger.order_by_tag(broker.name, ro.get('tag')):
+                imported.append(ledger.import_external_order(ro))
+
+        # 3. Compare today's orders; apply broker state where the state machine allows.
+        for lo in ledger.orders(broker.name, limit=100000, trading_day=today):
+            bo = lo['broker_order_id']
+            if not bo:
+                continue
+            ro = by_id.get(bo)
+            if ro is None:
+                mismatches.append({'type': 'MISSING_REMOTE_ORDER', 'client_order_id': lo['client_order_id'], 'broker_order_id': bo})
+                continue
+            if ro['status'] not in (lo['status'], 'UNKNOWN'):
+                applied, prev = ledger.transition(lo['client_order_id'], ro['status'], filled_qty=ro['filled_qty'],
+                                                  avg_price=ro['avg_price'] or None)
+                if not applied:
+                    mismatches.append({'type': 'STATE_CONFLICT', 'client_order_id': lo['client_order_id'], 'local': prev,
+                                       'broker': ro['status']})
+
+        # 4. DAY orders still working from a previous session have expired at the exchange.
+        for lo in ledger.working_orders(broker.name):
+            if lo['trading_date'] != today and lo['status'] not in TERMINAL:
+                ledger.transition(lo['client_order_id'], 'EXPIRED', reason='DAY_ORDER_PREVIOUS_SESSION')
+                expired.append(lo['client_order_id'])
+
+        positions_count = None
+        try:
+            positions, _ = await broker.positions()
+            positions_count = len(positions)
+            for p in positions:
+                ledger.upsert_position({'broker': broker.name, 'exchange': p.get('exchange', ''), 'symbol': p['symbol'],
+                                        'token': p['token'], 'qty': p['qty'], 'avg_price': 0, 'pnl': p.get('pnl') or 0})
+        except Exception as exc:  # noqa: BLE001 - positions are evidence for risk, not for order reconciliation
+            mismatches.append({'type': 'POSITIONS_UNAVAILABLE', 'error': str(exc)[:160]})
+
+        result = {'ok': not mismatches, 'broker': broker.name, 'trading_date': today, 'orders_count': len(remote),
+                  'positions_count': positions_count, 'mismatches': mismatches, 'resolved': resolved, 'expired': expired,
+                  'imported_external': imported}
+        ledger.record_reconciliation(broker.name, result['ok'], mismatches)
+        ledger.event('BROKER_RECONCILIATION', {k: v for k, v in result.items()})
+        return result

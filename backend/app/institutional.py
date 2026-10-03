@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-import time, uuid, hashlib, json
+import time, uuid, hashlib
 
 class FixMsgType(str, Enum):
     NEW='D'; CANCEL='F'; REPLACE='G'; EXEC_REPORT='8'; HEARTBEAT='0'
@@ -131,72 +131,14 @@ class ReleaseEvidence:
         missing=sorted(self.REQUIRED-set(k for k,v in evidence.items() if v is True))
         return {'certified':not missing,'missing':missing,'scope':'INTERNAL_ENGINEERING_RELEASE'}
 
-@dataclass
-class VolPoint:
-    strike:float; iv:float; weight:float=1.0
-class VolSurfaceEngine:
-    def fit_smile(self,spot,points):
-        if spot<=0 or len(points)<3:return {'status':'INSUFFICIENT_DATA'}
-        pts=sorted(points,key=lambda p:p.strike); atm=min(pts,key=lambda p:abs(p.strike-spot))
-        left=[p.iv for p in pts if p.strike<spot];right=[p.iv for p in pts if p.strike>spot]
-        return {'status':'OK','atm_iv':atm.iv,'put_skew':(sum(left)/len(left)-atm.iv) if left else None,'call_skew':(sum(right)/len(right)-atm.iv) if right else None,'points':len(pts)}
-class PortfolioGreeks:
-    def aggregate(self,positions):
-        keys=('delta','gamma','theta','vega');out={k:0.0 for k in keys}
-        for p in positions:
-            mult=float(p.get('qty',0))*float(p.get('lot_size',1))
-            for k in keys:out[k]+=float(p.get(k,0))*mult
-        return out
-class ScenarioRiskEngine:
-    def run(self,positions,spot_shocks=(-.05,0,.05),vol_shocks=(-.10,0,.10),days=1):
-        rows=[]; worst=0.0
-        for ss in spot_shocks:
-            for vs in vol_shocks:
-                pnl=0.0
-                for p in positions:
-                    q=float(p.get('qty',0))*float(p.get('lot_size',1)); spot=float(p.get('spot',0));
-                    pnl+=q*(float(p.get('delta',0))*spot*ss + .5*float(p.get('gamma',0))*(spot*ss)**2 + float(p.get('vega',0))*vs + float(p.get('theta',0))*days)
-                rows.append({'spot_shock':ss,'vol_shock':vs,'pnl':pnl});worst=min(worst,pnl)
-        return {'worst_pnl':worst,'scenarios':rows}
-class PreTradePortfolioRisk:
-    def assess(self,order,portfolio,scenarios,limits):
-        reasons=[]
-        if float(scenarios.get('worst_pnl',0)) < -float(limits.get('max_scenario_loss',1e18)):reasons.append('SCENARIO_LOSS_LIMIT')
-        if abs(float(portfolio.get('net_delta',0))+float(order.get('delta_impact',0)))>float(limits.get('max_abs_delta',1e18)):reasons.append('DELTA_LIMIT')
-        if float(portfolio.get('vega',0))+float(order.get('vega_impact',0))>float(limits.get('max_vega',1e18)):reasons.append('VEGA_LIMIT')
-        return {'approved':not reasons,'reasons':reasons}
-class SelfTradePrevention:
-    def check(self,order,working_orders):
-        for w in working_orders:
-            if w.get('symbol')==order.get('symbol') and w.get('side')!=order.get('side') and w.get('account')==order.get('account'):
-                return {'approved':False,'reason':'SELF_TRADE_RISK','conflicting_order':w.get('client_order_id')}
-        return {'approved':True}
-class AutoHedger:
-    def delta_hedge(self,net_delta,hedge_delta,lot_size=1):
-        if not hedge_delta or lot_size<=0:return {'status':'NO_VALID_HEDGE'}
-        lots=round(-net_delta/(hedge_delta*lot_size));return {'status':'PROPOSED','lots':lots,'qty':lots*lot_size,'requires_risk_approval':True}
-class AlgoOrderPlanner:
-    def iceberg(self,qty,disclosed):
-        if qty<=0 or disclosed<=0: return {'status':'INVALID'}
-        chunks=[];remaining=qty
-        while remaining: q=min(disclosed,remaining);chunks.append(q);remaining-=q
-        return {'status':'PLANNED','chunks':chunks}
-    def twap(self,qty,slices,start_ms,end_ms):
-        if qty<=0 or slices<=0 or end_ms<=start_ms:return {'status':'INVALID'}
-        base=qty//slices;rem=qty%slices;step=(end_ms-start_ms)/slices
-        return {'status':'PLANNED','orders':[{'qty':base+(1 if i<rem else 0),'due_ms':int(start_ms+i*step)} for i in range(slices) if base+(1 if i<rem else 0)>0]}
-class ExecutionTCA:
-    def summarize(self,fills,arrival_price,side):
-        qty=sum(float(f.get('qty',0)) for f in fills)
-        if qty<=0 or arrival_price<=0:return {'status':'INSUFFICIENT_DATA'}
-        avg=sum(float(f['qty'])*float(f['price']) for f in fills)/qty
-        return {'status':'OK','qty':qty,'avg_fill':avg,**TCAEngine().analyze(side,qty,arrival_price,avg)}
-class HAReadiness:
-    REQUIRED=('primary_feed','secondary_feed','primary_broker','secondary_broker','db_healthy','clock_synced','secondary_ready')
-    def assess(self,state):
-        missing=[k for k in self.REQUIRED if not state.get(k,False)];return {'ready':not missing,'missing':missing}
-# v2.2 derivatives benchmark capabilities
-try:
- from .benchmark import VolSurfaceEngine,VolPoint,ScenarioRiskEngine,PortfolioGreeks,PreTradePortfolioRisk,SelfTradePrevention,AutoHedger,AlgoOrderPlanner,ExecutionTCA,HAReadiness
-except ImportError:
- from benchmark import VolSurfaceEngine,VolPoint,ScenarioRiskEngine,PortfolioGreeks,PreTradePortfolioRisk,SelfTradePrevention,AutoHedger,AlgoOrderPlanner,ExecutionTCA,HAReadiness
+# Derivatives analytics live in benchmark.py; re-exported here for older callers.
+# These institutional classes are library components. Only the analytics are
+# exposed (as stateless calculators); FIX, multi-leg OMS, drop copy, allocation and
+# DR control are NOT wired into the live order path.
+from .benchmark import (AlgoOrderPlanner, AutoHedger, ExecutionTCA, HAReadiness, PortfolioGreeks,  # noqa: F401,E402
+                        PreTradePortfolioRisk, ScenarioRiskEngine, SelfTradePrevention, VolPoint, VolSurfaceEngine)
+
+__all__ = ['FixMsgType', 'FixEnvelope', 'FixGateway', 'ChildOrder', 'ParentOrder', 'MultiLegOMS', 'HierarchicalRiskBook',
+           'DropCopyService', 'AllocationEngine', 'TCAEngine', 'SurveillanceEngine', 'ExceptionManager', 'LatencyMonitor',
+           'DRController', 'ReleaseEvidence', 'AlgoOrderPlanner', 'AutoHedger', 'ExecutionTCA', 'HAReadiness', 'PortfolioGreeks',
+           'PreTradePortfolioRisk', 'ScenarioRiskEngine', 'SelfTradePrevention', 'VolPoint', 'VolSurfaceEngine']

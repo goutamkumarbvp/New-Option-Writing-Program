@@ -1,44 +1,128 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IORT V3.0.1</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IORT Terminal</title>
 <style>
-:root{font-family:Inter,system-ui,Arial;background:#07101d;color:#eef5ff}*{box-sizing:border-box}body{margin:0;background:#07101d}header{height:64px;padding:12px 20px;border-bottom:1px solid #263a56;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:5;background:#07101d}.brand{font-weight:800;letter-spacing:.3px}.statusbar{display:flex;gap:10px;align-items:center;font-size:12px}.pill{padding:5px 9px;border-radius:999px;border:1px solid #334b69}.live{color:#62e6a9}.bad{color:#ff7474}.warn{color:#ffd166}.tabs{display:flex;gap:4px;overflow:auto;padding:10px 16px;border-bottom:1px solid #22334d;position:sticky;top:64px;background:#07101d;z-index:4}.tabs button{background:transparent;color:#9fb2c9;border:0;border-bottom:2px solid transparent;padding:10px 14px;cursor:pointer;white-space:nowrap}.tabs button.active{color:#fff;border-bottom-color:#62e6a9}.page{display:none;padding:18px;max-width:1500px;margin:auto}.page.active{display:block}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:#0e1a2b;border:1px solid #263a56;border-radius:12px;padding:15px;min-height:110px}.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:1/-1}.value{font-size:22px;font-weight:800;margin-top:8px}.muted{color:#8296ad;font-size:12px}.ok{color:#62e6a9}.danger{color:#ff7474}.yellow{color:#ffd166}pre{white-space:pre-wrap;max-height:380px;overflow:auto;font-size:12px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:8px;border-bottom:1px solid #20334d}button.action{padding:10px 14px;border:0;border-radius:8px;font-weight:700;cursor:pointer}.dangerBtn{background:#7f1d1d;color:white}.control{display:flex;gap:8px;align-items:center;flex-wrap:wrap}input,select{background:#091522;color:#fff;border:1px solid #34506f;border-radius:7px;padding:9px}.eventlog{max-height:420px;overflow:auto;font-family:ui-monospace,monospace;font-size:11px}.event{padding:7px;border-bottom:1px solid #1b2c42}.sectionTitle{margin:0 0 10px}.metric{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1d3048}.metric:last-child{border:0}@media(max-width:900px){.span3,.span4,.span6,.span8{grid-column:1/-1}}
+:root{font-family:Inter,system-ui,Arial,sans-serif;color-scheme:dark;--bg:#07101d;--card:#0e1a2b;--line:#263a56;--muted:#8296ad;--ok:#62e6a9;--bad:#ff7474;--warn:#ffd166;--text:#eef5ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text)}
+header{min-height:64px;padding:12px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:5;background:var(--bg)}
+.brand{font-weight:800;letter-spacing:.3px}.statusbar{display:flex;gap:8px;align-items:center;font-size:12px;flex-wrap:wrap}
+.pill{padding:5px 9px;border-radius:999px;border:1px solid #334b69}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+.tabs{display:flex;gap:4px;overflow:auto;padding:8px 16px;border-bottom:1px solid #22334d;position:sticky;top:64px;background:var(--bg);z-index:4}
+.tabs button{background:transparent;color:#9fb2c9;border:0;border-bottom:2px solid transparent;padding:10px 14px;cursor:pointer;white-space:nowrap}
+.tabs button.active{color:#fff;border-bottom-color:var(--ok)}
+.page{display:none;padding:16px;max-width:1500px;margin:auto}.page.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:15px;min-height:100px;min-width:0}
+.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:1/-1}
+.value{font-size:22px;font-weight:800;margin-top:8px}.muted{color:var(--muted);font-size:12px}h3{margin:0 0 10px;font-size:15px}
+pre{white-space:pre-wrap;word-break:break-word;max-height:380px;overflow:auto;font-size:12px;margin:0}
+.tw{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:7px;border-bottom:1px solid #20334d;white-space:nowrap}
+.metric{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid #1d3048}.metric:last-child{border:0}
+.control{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+input,select{background:#091522;color:#fff;border:1px solid #34506f;border-radius:7px;padding:9px;max-width:100%}
+button.action{padding:10px 14px;border:0;border-radius:8px;font-weight:700;cursor:pointer;color:#fff}.red{background:#7f1d1d}.amber{background:#7a5a00}.blue{background:#1d3f7f}
+.eventlog{max-height:420px;overflow:auto;font-family:ui-monospace,monospace;font-size:11px}.event{padding:6px;border-bottom:1px solid #1b2c42;word-break:break-word}
+@media(max-width:900px){.s3,.s4,.s6,.s8{grid-column:1/-1}header{padding:10px 16px}.page{padding:12px 16px}}
 </style></head>
 <body>
-<header><div class="brand">IORT V3.0.1 — INSTITUTIONAL OPTIONS RISK TERMINAL</div><div class="statusbar"><span id="conn" class="pill warn">CONNECTING</span><span id="marketPill" class="pill bad">DATA UNAVAILABLE</span><span id="killPill" class="pill">KILL: OFF</span><span id="clock"></span></div></header>
+<header><div class="brand">IORT <span id="ver"></span> · OPTIONS RISK TERMINAL</div>
+<div class="statusbar"><span id="conn" class="pill warn">CONNECTING</span><span id="marketPill" class="pill bad">DATA UNAVAILABLE</span><span id="modePill" class="pill">PAPER</span><span id="killPill" class="pill">KILL: OFF</span><span id="clock" class="muted"></span></div></header>
 <nav class="tabs" id="tabs"></nav>
+
 <section id="overview" class="page active"><div class="grid">
-<div class="card span3"><div class="muted">MARKET</div><div id="ovMarket" class="value danger">DATA UNAVAILABLE</div></div>
-<div class="card span3"><div class="muted">EXECUTION</div><div id="ovExec" class="value danger">DISABLED</div></div>
-<div class="card span3"><div class="muted">WATCHDOG</div><div id="ovWatch" class="value">UNKNOWN</div></div>
-<div class="card span3"><div class="muted">EVENT BUS</div><div id="ovBus" class="value">UNKNOWN</div></div>
-<div class="card span6"><h3 class="sectionTitle">Broker Health</h3><div id="ovBrokers"></div></div>
-<div class="card span6"><h3 class="sectionTitle">Readiness Gate</h3><pre id="ovReady">Loading…</pre></div>
-<div class="card span12"><h3 class="sectionTitle">Live Event Stream</h3><div id="ovEvents" class="eventlog"></div></div>
+<div class="card s3"><div class="muted">MARKET</div><div id="ovMarket" class="value bad">DATA UNAVAILABLE</div></div>
+<div class="card s3"><div class="muted">EXECUTION</div><div id="ovExec" class="value bad">DISABLED</div></div>
+<div class="card s3"><div class="muted">FIRM P&amp;L (TOTAL / DAY)</div><div id="ovPnl" class="value">—</div></div>
+<div class="card s3"><div class="muted">READINESS</div><div id="ovReadyFlag" class="value">—</div></div>
+<div class="card s6"><h3>Broker health</h3><div id="ovBrokers"></div></div>
+<div class="card s6"><h3>Readiness blockers</h3><pre id="ovReady">Loading…</pre></div>
+<div class="card s12"><h3>Exceptions: ambiguous orders</h3><div class="tw"><table><thead><tr><th>Client ID</th><th>Broker</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Reason</th></tr></thead><tbody id="excRows"></tbody></table></div><p class="muted">An order here may be live at the broker. New orders on that broker stay blocked until reconciliation or an operator resolves it.</p></div>
+<div class="card s12"><h3>Event stream</h3><div id="ovEvents" class="eventlog"></div></div>
 </div></section>
-<section id="market" class="page"><div class="grid"><div class="card span8"><h3>Live Market Feed</h3><table><thead><tr><th>Token</th><th>Exchange</th><th>Symbol</th><th>LTP</th><th>Bid</th><th>Ask</th><th>TS</th></tr></thead><tbody id="marketRows"></tbody></table></div><div class="card span4"><h3>Feed Quality</h3><div id="marketQuality"></div></div><div class="card span12"><h3>Option Chain</h3><pre id="chainInfo">Select an instrument through the configured feed; chain state is backend-owned.</pre></div></div></section>
-<section id="risk" class="page"><div class="grid"><div class="card span4"><h3>Portfolio Risk Limits</h3><div id="riskLimits"></div></div><div class="card span4"><h3>Risk Evidence</h3><pre id="riskEvidence">Waiting for broker-authoritative evidence…</pre></div><div class="card span4"><h3>Kill Switch</h3><div id="riskKill" class="value">OFF</div><div class="muted">Persistent. New live orders are vetoed when active.</div></div><div class="card span12"><h3>Risk Events</h3><div id="riskEvents" class="eventlog"></div></div></div></section>
-<section id="ai" class="page"><div class="grid"><div class="card span6"><h3>AI / Strategy Pipeline</h3><div class="metric"><span>AI → Strategy</span><b>CONNECTED</b></div><div class="metric"><span>Strategy → Approval</span><b>CONNECTED</b></div><div class="metric"><span>Approval → Risk</span><b>CONNECTED</b></div><div class="metric"><span>Risk → Execution</span><b>GATED</b></div><p class="muted">AI never bypasses approval or independent risk.</p></div><div class="card span6"><h3>Execution Mode</h3><div class="metric"><span>Live Trading</span><b id="aiLive">OFF</b></div><div class="metric"><span>Auto Trading</span><b id="aiAuto">OFF</b></div><div class="metric"><span>Human Approval</span><b id="aiApproval">REQUIRED</b></div></div></div></section>
-<section id="execution" class="page"><div class="grid"><div class="card span4"><h3>Execution Controls</h3><div class="metric"><span>Smart Routing</span><b id="exRoute">OFF</b></div><div class="metric"><span>Operator Auth</span><b id="exAuth">REQUIRED</b></div><div class="metric"><span>Instrument Master</span><b id="exInst">REQUIRED</b></div></div><div class="card span8"><h3>Operator</h3><div class="control"><input id="op" type="password" placeholder="Operator token (local only)"><button class="action dangerBtn" onclick="panic()">PANIC / KILL</button></div><p class="muted">Token is held only in this browser session. It is never rendered into the event log.</p></div><div class="card span12"><h3>Execution Events</h3><div id="executionEvents" class="eventlog"></div></div></div></section>
-<section id="orders" class="page"><div class="grid"><div class="card span12"><h3>Order Lifecycle</h3><table><thead><tr><th>Client ID</th><th>Broker</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Filled</th><th>Status</th><th>Avg</th></tr></thead><tbody id="orderRows"></tbody></table></div></div></section>
-<section id="recon" class="page"><div class="grid"><div class="card span6"><h3>Reconciliation</h3><pre id="reconState">Loading…</pre></div><div class="card span6"><h3>Ledger</h3><pre id="ledgerState">Loading…</pre></div><div class="card span12"><h3>Recent Reconciliation Events</h3><div id="reconEvents" class="eventlog"></div></div></div></section>
-<section id="tca" class="page"><div class="grid"><div class="card span6"><h3>TCA Wiring</h3><div class="metric"><span>Decision Price → Fill</span><b>CONNECTED</b></div><div class="metric"><span>Slippage Gate</span><b>PRE-TRADE</b></div><div class="metric"><span>Post-trade Ledger</span><b>CONNECTED</b></div></div><div class="card span6"><h3>Execution Statistics</h3><pre id="tcaState">Awaiting fills…</pre></div></div></section>
-<section id="surveillance" class="page"><div class="grid"><div class="card span6"><h3>Audit Chain</h3><pre id="auditState">Loading…</pre></div><div class="card span6"><h3>Surveillance Controls</h3><div class="metric"><span>Self-trade check</span><b>ENABLED</b></div><div class="metric"><span>Kill / override audit</span><b>ENABLED</b></div><div class="metric"><span>Order lifecycle audit</span><b>ENABLED</b></div></div></div></section>
-<section id="system" class="page"><div class="grid"><div class="card span6"><h3>System Health</h3><pre id="systemState">Loading…</pre></div><div class="card span6"><h3>Workers</h3><pre id="workerState">Loading…</pre></div><div class="card span12"><h3>Architecture Wiring</h3><pre>NSE/BSE/MCX → Live Feed → Normalizer → Quality → Chain/Greeks → AI → Strategy → Approval → Dual Risk → Kill/Watchdog → Router → Broker → Order Lifecycle → Ledger → Reconciliation → TCA/Audit/Surveillance → Dashboard</pre></div></div></section>
+
+<section id="market" class="page"><div class="grid">
+<div class="card s8"><h3>Live market feed</h3><div class="tw"><table><thead><tr><th>Broker</th><th>Token</th><th>Exchange</th><th>Symbol</th><th>LTP</th><th>Bid</th><th>Ask</th><th>OI</th><th>Exchange time</th></tr></thead><tbody id="marketRows"></tbody></table></div></div>
+<div class="card s4"><h3>Feed quality</h3><div id="marketQuality"></div><h3 style="margin-top:14px">Stream workers</h3><pre id="workerState"></pre></div>
+<div class="card s12"><h3>Option chains (instrument-master enriched)</h3><pre id="chainInfo"></pre></div>
+</div></section>
+
+<section id="risk" class="page"><div class="grid">
+<div class="card s4"><h3>Limits</h3><div id="riskLimits"></div></div>
+<div class="card s8"><h3>Broker-authoritative book</h3><div id="riskSnaps"></div></div>
+<div class="card s4"><h3>Kill switch</h3><div id="riskKill" class="value">OFF</div><div id="riskKillWhy" class="muted"></div></div>
+<div class="card s8"><h3>Risk events (blocks, alerts, kills)</h3><div id="riskEvents" class="eventlog"></div></div>
+</div></section>
+
+<section id="controls" class="page"><div class="grid">
+<div class="card s6"><h3>Pre-trade controls in force</h3><div id="ctlList"></div></div>
+<div class="card s6"><h3>Decision layer</h3><div id="aiInfo"></div><p class="muted">The evidence scorers are rule-based heuristics without validated predictive edge. In VETO_CONTRADICTION mode they only block an order that contradicts a confident signal. They never create orders.</p></div>
+</div></section>
+
+<section id="execution" class="page"><div class="grid">
+<div class="card s12"><h3>Operator controls</h3>
+<div class="control"><input id="op" type="password" autocomplete="off" placeholder="Operator token"><span class="muted">Held in this tab only; never sent to the event log.</span></div>
+<div class="control"><button class="action red" onclick="panic()">PANIC: ENGAGE KILL SWITCH</button>
+<input id="resetWhy" placeholder="Reset reason (required)"><button class="action amber" onclick="resetKill()">Reset kill switch</button></div>
+<div class="control"><select id="esBroker"><option>ZERODHA</option><option>UPSTOX</option><option>ANGEL</option><option>KOTAK</option></select>
+<label class="muted"><input id="esFlatten" type="checkbox"> also flatten positions</label>
+<button class="action red" onclick="emergency()">Emergency stop broker</button>
+<button class="action blue" onclick="reconcileNow()">Reconcile broker now</button></div></div>
+<div class="card s12"><h3>Execution events</h3><div id="executionEvents" class="eventlog"></div></div>
+</div></section>
+
+<section id="orders" class="page"><div class="grid"><div class="card s12"><h3>Order lifecycle</h3><div class="tw"><table><thead><tr><th>Created</th><th>Client ID</th><th>Broker</th><th>Broker ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Filled</th><th>Status</th><th>Avg</th><th>Origin</th><th>Reason</th></tr></thead><tbody id="orderRows"></tbody></table></div></div></div></section>
+
+<section id="recon" class="page"><div class="grid">
+<div class="card s6"><h3>Last reconciliation per broker</h3><pre id="reconState">Loading…</pre></div>
+<div class="card s6"><h3>Ledger</h3><pre id="ledgerState">Loading…</pre></div>
+<div class="card s12"><h3>Reconciliation events</h3><div id="reconEvents" class="eventlog"></div></div>
+</div></section>
+
+<section id="tca" class="page"><div class="grid"><div class="card s12"><h3>Transaction cost (arrival price vs average fill)</h3><div class="tw"><table><thead><tr><th>Client ID</th><th>Side</th><th>Arrival</th><th>Avg fill</th><th>Slippage (bps, + = cost)</th></tr></thead><tbody id="tcaRows"></tbody></table></div></div></div></section>
+
+<section id="system" class="page"><div class="grid">
+<div class="card s6"><h3>System</h3><pre id="systemState">Loading…</pre></div>
+<div class="card s6"><h3>Audit chain and instruments</h3><pre id="auditState">Loading…</pre></div>
+</div></section>
+
 <script>
-const TAB_DEFS=[['overview','Overview'],['market','Market'],['risk','Risk'],['ai','AI / Strategy'],['execution','Execution'],['orders','Orders'],['recon','Reconciliation'],['tca','TCA'],['surveillance','Surveillance'],['system','System']];
-const state={}; let ws=null; let reconnectTimer=null; let eventSeq=0;
-const $=id=>document.getElementById(id);
-function initTabs(){TAB_DEFS.forEach(([id,label],i)=>{const b=document.createElement('button');b.textContent=label;b.onclick=()=>showTab(id);b.dataset.tab=id;if(i===0)b.classList.add('active');$('tabs').appendChild(b)});}
-function showTab(id){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===id));document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x.dataset.tab===id));}
-function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function logEvent(target,e){const el=$(target);if(!el)return;const row=document.createElement('div');row.className='event';row.textContent=new Date().toLocaleTimeString()+'  '+(e.type||'EVENT')+'  '+JSON.stringify(e.payload||e.tick||e);el.prepend(row);while(el.children.length>80)el.removeChild(el.lastChild);}
-function render(s){Object.assign(state,s);const sys=s.system||{}; $('ovMarket').textContent=sys.market||'DATA_UNAVAILABLE';$('ovMarket').className='value '+(sys.market==='LIVE'?'ok':'danger');$('ovExec').textContent=sys.live_trading?'LIVE ENABLED':'DISABLED';$('ovExec').className='value '+(sys.live_trading?'ok':'danger');$('ovWatch').textContent=sys.watchdog?'HEALTHY':'FAILED';$('ovWatch').className='value '+(sys.watchdog?'ok':'danger');$('ovBus').textContent=sys.durable_event_bus?'READY':'NOT READY';$('ovBus').className='value '+(sys.durable_event_bus?'ok':'yellow');$('marketPill').textContent=sys.market||'DATA_UNAVAILABLE';$('marketPill').className='pill '+(sys.market==='LIVE'?'live':'bad');$('killPill').textContent='KILL: '+(sys.kill_switch?'ON':'OFF');$('killPill').className='pill '+(sys.kill_switch?'bad':'ok');$('conn').className='pill ok';$('conn').textContent='CONNECTED';
-$('ovBrokers').innerHTML=(s.brokers||[]).map(b=>`<div class="metric"><span>${esc(b.broker)}</span><b class="${b.status==='OK'||b.authenticated?'ok':'yellow'}">${esc(b.status||'UNKNOWN')}</b></div>`).join('')||'<span class="muted">No broker data</span>';
-$('ovReady').textContent=JSON.stringify(s.readiness||{},null,2);$('marketRows').innerHTML=(s.market?.last_ticks||[]).map(t=>`<tr><td>${esc(t.instrument_token)}</td><td>${esc(t.exchange)}</td><td>${esc(t.symbol)}</td><td>${esc(t.ltp)}</td><td>${esc(t.bid)}</td><td>${esc(t.ask)}</td><td>${esc(t.ts)}</td></tr>`).join('');$('marketQuality').innerHTML=`<div class="metric"><span>Rejected ticks</span><b>${s.market?.rejected_ticks??0}</b></div><div class="metric"><span>Last tick count</span><b>${s.market?.last_ticks?.length??0}</b></div>`;
-$('riskLimits').innerHTML=Object.entries(s.risk||{}).map(([k,v])=>`<div class="metric"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');$('riskKill').textContent=sys.kill_switch?'ACTIVE':'OFF';$('riskKill').className='value '+(sys.kill_switch?'danger':'ok');$('aiLive').textContent=sys.live_trading?'ON':'OFF';$('aiAuto').textContent=sys.auto_trading?'ON':'OFF';$('aiApproval').textContent=s.execution?.approval_required?'REQUIRED':'POLICY DEPENDENT';$('exRoute').textContent=s.execution?.smart_routing?'ON':'OFF';$('exAuth').textContent=s.execution?.operator_auth_required_live?'REQUIRED':'NOT REQUIRED';$('exInst').textContent=s.reconciliation?.instrument_master_required?'REQUIRED':'OPTIONAL';
-$('orderRows').innerHTML=(s.orders||[]).slice().reverse().map(o=>`<tr><td>${esc(o.client_order_id)}</td><td>${esc(o.broker)}</td><td>${esc(o.symbol)}</td><td>${esc(o.side)}</td><td>${esc(o.qty)}</td><td>${esc(o.filled_qty)}</td><td>${esc(o.status)}</td><td>${esc(o.avg_price)}</td></tr>`).join('');$('reconState').textContent=JSON.stringify(s.reconciliation||{},null,2);$('ledgerState').textContent=JSON.stringify(s.ledger||{},null,2);$('systemState').textContent=JSON.stringify(sys,null,2);$('workerState').textContent=JSON.stringify(sys.workers||[],null,2);$('auditState').textContent=JSON.stringify(s.audit||{},null,2);$('tcaState').textContent=JSON.stringify({orders:(s.orders||[]).length,filled:(s.orders||[]).filter(x=>x.status==='FILLED').length},null,2);}
-async function refresh(){try{const r=await fetch('/dashboard/state',{cache:'no-store'});if(!r.ok)throw new Error(r.status);render(await r.json())}catch(e){$('conn').textContent='BACKEND UNAVAILABLE';$('conn').className='pill bad';$('marketPill').textContent='DATA UNAVAILABLE';$('marketPill').className='pill bad'}}
-function connectWS(){if(ws&&ws.readyState<2)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/events');ws.onopen=()=>{$('conn').textContent='EVENT STREAM';$('conn').className='pill ok'};ws.onmessage=ev=>{try{const e=JSON.parse(ev.data);eventSeq++;logEvent('ovEvents',e);['riskEvents','executionEvents','reconEvents'].forEach(id=>{if(['KILL_SWITCH','RISK_BLOCK','RISK_ALERT'].includes(e.type)&&id==='riskEvents'||['ORDER_SUBMISSION','ORDER_UPDATE','EMERGENCY_STOP'].includes(e.type)&&id==='executionEvents'||e.type==='RECONCILIATION'&&id==='reconEvents')logEvent(id,e)});if(e.type==='KILL_SWITCH')refresh();if(e.type==='ORDER_SUBMISSION'||e.type==='RECONCILIATION')refresh()}catch{}};ws.onclose=()=>{ $('conn').textContent='RECONNECTING';$('conn').className='pill warn';clearTimeout(reconnectTimer);reconnectTimer=setTimeout(connectWS,1500)};ws.onerror=()=>{try{ws.close()}catch{}};}
-async function panic(){const token=$('op').value.trim();if(!token){alert('Operator token required');return}const r=await fetch('/kill?reason=UI_PANIC',{method:'POST',headers:{'X-IORT-Operator-Token':token}});const j=await r.json();logEvent('executionEvents',{type:'CONTROL_RESULT',payload:j});await refresh();}
-initTabs();refresh();connectWS();setInterval(refresh,2000);setInterval(()=>$('clock').textContent=new Date().toLocaleTimeString(),500);
+const TABS=[['overview','Overview'],['market','Market'],['risk','Risk'],['controls','Controls'],['execution','Execution'],['orders','Orders'],['recon','Reconciliation'],['tca','TCA'],['system','System']];
+let ws=null,reconnectTimer=null;const $=id=>document.getElementById(id);
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=n=>n==null?'—':Number(n).toLocaleString('en-IN',{maximumFractionDigits:2});
+const cls=(el,c)=>{el.className=el.className.replace(/\b(ok|bad|warn)\b/g,'').trim()+' '+c};
+function initTabs(){TABS.forEach(([id,label],i)=>{const b=document.createElement('button');b.textContent=label;b.dataset.tab=id;b.onclick=()=>showTab(id);if(!i)b.classList.add('active');$('tabs').appendChild(b)})}
+function showTab(id){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===id));document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x.dataset.tab===id))}
+function logEvent(target,e){const el=$(target);if(!el)return;const row=document.createElement('div');row.className='event';row.textContent=new Date().toLocaleTimeString()+'  '+(e.type||'EVENT')+'  '+JSON.stringify(e.payload||e);el.prepend(row);while(el.children.length>100)el.removeChild(el.lastChild)}
+const metric=(k,v,c='')=>`<div class="metric"><span>${esc(k)}</span><b class="${c}">${esc(v)}</b></div>`;
+function render(s){const sys=s.system||{};$('ver').textContent='v'+(s.version||'');
+ const live=sys.market==='LIVE';$('ovMarket').textContent=sys.market||'DATA_UNAVAILABLE';cls($('ovMarket'),live?'ok':'bad');$('marketPill').textContent=sys.market||'DATA_UNAVAILABLE';cls($('marketPill'),live?'ok':'bad');
+ $('ovExec').textContent=sys.live_trading?'LIVE ENABLED':'DISABLED';cls($('ovExec'),sys.live_trading?'warn':'bad');$('modePill').textContent=sys.live_trading?'LIVE':'PAPER';cls($('modePill'),sys.live_trading?'warn':'ok');
+ const k=sys.kill||{};$('killPill').textContent='KILL: '+(k.active?'ON':'OFF');cls($('killPill'),k.active?'bad':'ok');$('riskKill').textContent=k.active?'ACTIVE':'OFF';cls($('riskKill'),k.active?'bad':'ok');$('riskKillWhy').textContent=k.reason?`${k.reason} · ${k.actor||''} · ${k.at||''}`:'';
+ $('conn').textContent='CONNECTED';cls($('conn'),'ok');
+ const agg=(s.risk||{}).aggregate||{};$('ovPnl').textContent=`${fmt(agg.total_pnl)} / ${fmt(agg.day_pnl)}`;cls($('ovPnl'),(agg.total_pnl||0)<0?'bad':'ok');
+ const rd=s.readiness||{};$('ovReadyFlag').textContent=rd.ready?'READY':'BLOCKED';cls($('ovReadyFlag'),rd.ready?'ok':'bad');$('ovReady').textContent=(rd.reasons||[]).join('\n')||'none';
+ $('ovBrokers').innerHTML=(s.brokers||[]).map(b=>metric(b.broker,b.status||'UNKNOWN',b.status==='LIVE'?'ok':b.status==='UNCONFIGURED'?'':'bad')).join('')||'<span class="muted">No broker data</span>';
+ $('excRows').innerHTML=(s.exceptions||[]).map(o=>`<tr><td>${esc(o.client_order_id)}</td><td>${esc(o.broker)}</td><td>${esc(o.symbol)}</td><td>${esc(o.side)}</td><td>${esc(o.qty)}</td><td class="bad">${esc(o.status)}</td><td>${esc(o.last_reason)}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">None</td></tr>';
+ $('marketRows').innerHTML=(s.market?.last_ticks||[]).map(t=>`<tr><td>${esc(t.broker)}</td><td>${esc(t.instrument_token)}</td><td>${esc(t.exchange)}</td><td>${esc(t.symbol)}</td><td>${esc(t.ltp)}</td><td>${esc(t.bid)}</td><td>${esc(t.ask)}</td><td>${esc(t.oi)}</td><td>${t.exchange_ts_ms?esc(new Date(t.exchange_ts_ms).toLocaleTimeString()):'—'}</td></tr>`).join('');
+ const st=s.market?.stats||{};$('marketQuality').innerHTML=metric('Accepted ticks',st.accepted??0)+Object.entries(st.rejected_by_reason||{}).map(([r,n])=>metric('Rejected: '+r,n,'warn')).join('')+metric('Live brokers',(st.live_brokers||[]).join(', ')||'none');
+ $('workerState').textContent=JSON.stringify(sys.workers||[],null,2);$('chainInfo').textContent=JSON.stringify(s.option_chain?.chains||[],null,2);
+ $('riskLimits').innerHTML=Object.entries(s.risk?.limits||{}).map(([a,b])=>metric(a,fmt(b))).join('');
+ $('riskSnaps').innerHTML=Object.values(s.risk?.snapshots||{}).map(x=>`<div class="metric"><span><b>${esc(x.broker)}</b> ${x.ok?'<span class="ok">OK</span>':'<span class="bad">NOT USABLE</span>'} · age ${esc(x.age_sec)}s</span><span>P&amp;L ${fmt(x.total_pnl)} · day ${fmt(x.day_pnl)} (${esc(x.day_pnl_source||'—')}) · margin ${x.margin?fmt(x.margin.pct)+'%':'—'} · exposure ${fmt(x.premium_exposure)} · short notional ${fmt(x.short_option_notional)}</span></div>${(x.issues||[]).length||x.error?`<div class="muted bad">${esc([x.error,...(x.issues||[])].filter(Boolean).join(' · '))}</div>`:''}`).join('')||'<span class="muted">No configured broker snapshots</span>';
+ const c=s.controls||{};$('ctlList').innerHTML=Object.entries(c).map(([a,b])=>metric(a.replaceAll('_',' '),b===true?'ON':b===false?'OFF':b,b===false?'warn':'')).join('');
+ $('aiInfo').innerHTML=metric('Gate mode',c.ai_gate_mode)+metric('Auto trading',sys.auto_trading?'ON':'OFF')+metric('Human approval for AUTO',s.execution?.approval_required?'REQUIRED':'NOT REQUIRED');
+ $('orderRows').innerHTML=(s.orders||[]).map(o=>`<tr><td>${esc((o.created_at||'').slice(11,19))}</td><td>${esc(o.client_order_id)}</td><td>${esc(o.broker)}</td><td>${esc(o.broker_order_id)}</td><td>${esc(o.symbol)}</td><td>${esc(o.side)}</td><td>${esc(o.qty)}</td><td>${esc(o.filled_qty)}</td><td>${esc(o.status)}</td><td>${esc(o.avg_price)}</td><td>${esc(o.origin)}</td><td>${esc(o.last_reason)}</td></tr>`).join('');
+ $('reconState').textContent=JSON.stringify(s.reconciliation||{},null,2);$('ledgerState').textContent=JSON.stringify(s.ledger||{},null,2);
+ $('tcaRows').innerHTML=(s.tca||[]).map(x=>`<tr><td>${esc(x.client_order_id)}</td><td>${esc(x.side)}</td><td>${esc(x.arrival)}</td><td>${esc(x.avg_fill)}</td><td class="${x.slippage_bps>0?'bad':'ok'}">${esc(x.slippage_bps)}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">No fills yet</td></tr>';
+ $('systemState').textContent=JSON.stringify(sys,null,2);$('auditState').textContent=JSON.stringify({audit:s.audit,instruments:s.instruments},null,2)}
+async function refresh(){try{const r=await fetch('/dashboard/state',{cache:'no-store'});if(!r.ok)throw new Error(r.status);render(await r.json())}catch(e){$('conn').textContent='BACKEND UNAVAILABLE';cls($('conn'),'bad');$('marketPill').textContent='DATA UNAVAILABLE';cls($('marketPill'),'bad')}}
+const ROUTE={riskEvents:['KILL_SWITCH','KILL_SWITCH_RESET','RISK_BLOCK','RISK_ALERT'],executionEvents:['ORDER_SUBMISSION','ORDER_UPDATE','FILL','EMERGENCY_STOP','CONTROL_RESULT'],reconEvents:['RECONCILIATION']};
+function connectWS(){if(ws&&ws.readyState<2)return;ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/events');
+ ws.onopen=()=>{$('conn').textContent='EVENT STREAM';cls($('conn'),'ok')};
+ ws.onmessage=ev=>{let e;try{e=JSON.parse(ev.data)}catch{return}if(e.type==='MARKET_TICK'||e.type==='HEARTBEAT')return;logEvent('ovEvents',e);for(const[id,types]of Object.entries(ROUTE))if(types.includes(e.type))logEvent(id,e);if(['KILL_SWITCH','KILL_SWITCH_RESET','ORDER_SUBMISSION','ORDER_UPDATE','FILL','RECONCILIATION','EMERGENCY_STOP'].includes(e.type))refresh()};
+ ws.onclose=()=>{$('conn').textContent='RECONNECTING';cls($('conn'),'warn');clearTimeout(reconnectTimer);reconnectTimer=setTimeout(connectWS,1500)};ws.onerror=()=>{try{ws.close()}catch{}}}
+async function control(url){const token=$('op').value.trim();if(!token){alert('Operator token required');return}const r=await fetch(url,{method:'POST',headers:{'X-IORT-Operator-Token':token}});let j;try{j=await r.json()}catch{j={http:r.status}}logEvent('executionEvents',{type:'CONTROL_RESULT',payload:j});await refresh()}
+const panic=()=>control('/kill?reason=UI_PANIC');
+function resetKill(){const why=$('resetWhy').value.trim();if(why.length<3){alert('Give a reset reason');return}if(confirm('Reset the kill switch? New orders become possible again.'))control('/kill/reset?reason='+encodeURIComponent(why))}
+function emergency(){const b=$('esBroker').value,f=$('esFlatten').checked;if(confirm(`Emergency stop ${b}${f?' AND FLATTEN ALL POSITIONS':''}?`))control(`/emergency-stop/${b}?flatten=${f}`)}
+const reconcileNow=()=>control('/reconcile/'+$('esBroker').value);
+initTabs();refresh();connectWS();setInterval(refresh,3000);setInterval(()=>$('clock').textContent=new Date().toLocaleTimeString(),1000);
 </script></body></html>

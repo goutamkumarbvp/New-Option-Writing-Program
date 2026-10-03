@@ -1,14 +1,15 @@
-fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-pydantic>=2.8,<3
-httpx>=0.27,<1
-sqlalchemy>=2,<3
-pytest>=8,<9
-kiteconnect>=5,<6
-upstox-python-sdk>=2,<3
-smartapi-python>=1,<2
-kotakneoapi>=3,<4
-websockets>=13,<16
-protobuf>=5,<7
-psycopg[binary]>=3.2,<4
-redis>=5,<7
+# Exact versions verified by the v3.1.0 test suite on Python 3.11.
+# Upgrade deliberately: broker SDK field names and callback signatures are part of the contract.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
+httpx==0.28.1
+SQLAlchemy==2.1.3
+psycopg[binary]==3.3.6
+redis==6.4.0
+websockets==15.0.1
+protobuf==6.33.6
+kiteconnect==5.2.2
+upstox-python-sdk==2.30.0
+smartapi-python==1.5.5
+kotakneoapi==3.0.7
