@@ -79,7 +79,7 @@ table.chain td.stale{opacity:.4}table.chain td.empty{text-align:left;white-space
 <div id="chStats" class="stats"></div></div>
 <div class="card s9"><div class="chainhead"><span class="ceh">CALLS</span><span class="muted">Click a Bid to sell (write) · an Ask to buy</span><span class="peh">PUTS</span></div>
 <div id="chWrap" class="chainwrap"><table class="chain"><thead id="chHead"></thead><tbody id="chRows"></tbody></table></div>
-<p class="muted">IV and Greeks are Black-Scholes values from the quote mid (MODEL), or the broker's IV when no spot is available (FEED). Spot comes from UNDERLYING_SPOT_TOKENS_JSON, else a put-call parity estimate. OI chg counts from the first tick this terminal saw today. Shaded cells are in the money. Dimmed cells are stale.</p></div>
+<p class="muted">IV and Greeks are Black-Scholes values from the quote mid (MODEL), or the broker's IV when no spot is available (FEED). Spot comes from a live index or cash tick of the underlying (UNDERLYING_SPOT_TOKENS_JSON can name one), else a put-call parity estimate. OI chg counts from the first tick this terminal saw today. Shaded cells are in the money. Dimmed cells are stale.</p></div>
 <div class="card s3 ticket"><h3>Order ticket</h3>
 <div id="tkEmpty" class="muted">Click a <b>Bid</b> in the chain to write (sell) that option, or an <b>Ask</b> to buy it.<br><br>Orders go through every pre-trade control, the kill switch and operator auth. In paper mode they are blocked before reaching a broker.</div>
 <div id="tkBody" hidden>
@@ -209,15 +209,15 @@ async function chLoadLadder(){if(CH.busy)return;if(!CH.idx.length||!CH.sel.sym||
  const i=CH.sel.sym.indexOf('|'),ex=CH.sel.sym.slice(0,i),und=CH.sel.sym.slice(i+1),exp=CH.sel.exp,q=CH.sel.depth&&CH.sel.depth!=='0'?'?depth='+CH.sel.depth:'';
  CH.busy=true;try{const r=await fetch(`/option-chain/${encodeURIComponent(ex)}/${encodeURIComponent(und)}/${encodeURIComponent(exp)}/ladder${q}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status);
   const d=await r.json();if(CH.sel.sym!==ex+'|'+und||CH.sel.exp!==exp)return;CH.data=d;if(!CH.hold)chRender()}catch{chSetStatus('BACKEND UNAVAILABLE','bad')}finally{CH.busy=false}}
-function chStats(d){const s=d.summary||{},sp=d.spot||{},src={SPOT_TOKEN:['SPOT TOKEN','ok'],PUT_CALL_PARITY:['PARITY ESTIMATE','warn']}[sp.source]||['SPOT UNAVAILABLE','bad'];
+function chStats(d){const s=d.summary||{},sp=d.spot||{},src={SPOT_TOKEN:['LIVE SPOT','ok'],PUT_CALL_PARITY:['PARITY ESTIMATE','warn']}[sp.source]||['SPOT UNAVAILABLE','bad'];
  const tile=(l,v,sub='')=>`<div class="stat"><div class="muted">${esc(l)}</div><div class="v">${esc(v)}</div>${sub?`<div class="muted">${sub}</div>`:''}</div>`;
- $('chStats').innerHTML=tile('Spot',sp.value?fmt(sp.value):'—',`<span class="badge ${src[1]}">${src[0]}</span>`)+tile('ATM strike',d.atm_strike!=null?fmt(d.atm_strike):'—')
+ $('chStats').innerHTML=tile('Spot',sp.value?fmt(sp.value):'—',`<span class="badge ${src[1]}">${src[0]}</span>${sp.symbol?' <span class="muted">'+esc(sp.symbol)+'</span>':''}`)+tile('ATM strike',d.atm_strike!=null?fmt(d.atm_strike):'—')
   +tile('Days to expiry',d.days_to_expiry!=null?d.days_to_expiry.toFixed(1):'—',esc(d.expiry?expLabel(d.expiry):''))
   +tile('PCR (OI)',s.pcr!=null?s.pcr.toFixed(2):'—','Volume PCR '+(s.pcr_volume!=null?s.pcr_volume.toFixed(2):'—'))+tile('Max pain',s.max_pain!=null?fmt(s.max_pain):'—')
   +tile('ATM IV',s.atm_iv!=null?(s.atm_iv*100).toFixed(1)+'%':'—')+tile('ATM straddle',s.atm_straddle!=null?fmt(s.atm_straddle):'—',s.expected_move_pct!=null?'≈ ±'+s.expected_move_pct.toFixed(2)+'% expected move':'')
   +tile('Call OI / Put OI',compact(s.ce_oi)+' / '+compact(s.pe_oi),'chg '+esc(signed(s.ce_oi_change))+' / '+esc(signed(s.pe_oi_change)))}
 function chRenderEmpty(){const cols=chCols();chHead(cols);chStats({});chSetStatus('DATA UNAVAILABLE','bad');$('chUpdated').textContent='';
- $('chRows').innerHTML=`<tr><td class="empty" colspan="${cols.length*2+1}"><b>DATA UNAVAILABLE.</b> No live option ticks have reached the chain. Load each broker's instrument master (INSTRUMENT_MASTER_URLS_JSON) and subscribe the option tokens you want (SUBSCRIPTION_JSON). Set UNDERLYING_SPOT_TOKENS_JSON for an exact spot instead of the parity estimate.</td></tr>`}
+ $('chRows').innerHTML=`<tr><td class="empty" colspan="${cols.length*2+1}"><b>DATA UNAVAILABLE.</b> No live option ticks have reached the chain. Load each broker's instrument master (INSTRUMENT_MASTER_URLS_JSON) and subscribe the option tokens you want (SUBSCRIPTION_JSON). Subscribe the index (for Kotak, "nse_cm|Nifty 50") for an exact spot instead of the parity estimate.</td></tr>`}
 function chCell(leg,key,typ,strike,maxOI){if(!leg)return'<td></td>';
  const c=[];if(leg.itm)c.push('itm');if(leg.stale)c.push('stale');let v,st='',title=leg.stale?`Last update ${Math.round(leg.age_ms/1000)}s ago`:'';
  switch(key){case'oi':{const w=maxOI?Math.round(leg.oi/maxOI*100):0;st=` style="background-image:linear-gradient(${typ==='CE'?'to left':'to right'},${typ==='CE'?'rgba(255,116,116,.28)':'rgba(98,230,169,.25)'} ${w}%,transparent ${w}%)"`;v=compact(leg.oi);break}
@@ -230,7 +230,7 @@ function chCell(leg,key,typ,strike,maxOI){if(!leg)return'<td></td>';
  return`<td class="${c.join(' ')}" title="${esc(title)}"${st}>${esc(v)}</td>`}
 function chRender(){const d=CH.data;if(!d||!(d.strikes||[]).length){chRenderEmpty();return}
  const cols=chCols(),pc=[...cols].reverse(),S=d.spot&&d.spot.value,maxOI=Math.max(1,...d.strikes.flatMap(r=>[r.CE?.oi||0,r.PE?.oi||0]));chHead(cols);
- const spotRow=()=>`<tr class="spotrow"><td colspan="${cols.length*2+1}">SPOT ${esc(fmt(S))} · ${d.spot.source==='SPOT_TOKEN'?'spot token':'put-call parity estimate'}</td></tr>`;
+ const spotRow=()=>`<tr class="spotrow"><td colspan="${cols.length*2+1}">SPOT ${esc(fmt(S))} · ${d.spot.source==='SPOT_TOKEN'?esc((d.spot.symbol||'spot token')+(d.spot.broker?' · '+d.spot.broker:'')):'put-call parity estimate'}</td></tr>`;
  let html='',spotDone=!S;for(const r of d.strikes){if(!spotDone&&r.strike>S){html+=spotRow();spotDone=true}
   html+=`<tr class="${r.strike===d.atm_strike?'atm':''}">`+cols.map(([k])=>chCell(r.CE,k,'CE',r.strike,maxOI)).join('')
    +`<td class="k">${esc(fmt(r.strike))}<span class="pcr">${r.pcr!=null?'PCR '+r.pcr.toFixed(2):''}</span></td>`+pc.map(([k])=>chCell(r.PE,k,'PE',r.strike,maxOI)).join('')+'</tr>'}

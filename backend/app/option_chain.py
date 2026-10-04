@@ -63,7 +63,13 @@ def resolve_spot(feed, underlying, expiry, rows, r=None, now_ms=None):
             if token and feed.live_instrument(broker, token):
                 tk = feed.tick(broker, token)
                 if tk and tk.ltp > 0:
-                    return {'value': tk.ltp, 'source': 'SPOT_TOKEN', 'broker': str(broker).upper(), 'strike': None}
+                    return {'value': tk.ltp, 'source': 'SPOT_TOKEN', 'broker': str(broker).upper(), 'strike': None,
+                            'symbol': str(token)}
+    # No configured token: any live tick of the underlying itself (a streamed index such as
+    # Kotak "Nifty 50" -> NIFTY, or an instrument-master-enriched cash instrument).
+    tk = feed.live_spot(underlying) if feed is not None and hasattr(feed, 'live_spot') else None
+    if tk:
+        return {'value': tk.ltp, 'source': 'SPOT_TOKEN', 'broker': tk.broker.upper(), 'strike': None, 'symbol': tk.instrument_token}
     try:
         T = years_to_expiry(expiry, datetime.fromtimestamp(now_ms / 1000, tz=IST))
     except (TypeError, ValueError):

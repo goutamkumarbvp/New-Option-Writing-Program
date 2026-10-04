@@ -8,6 +8,7 @@ loop.call_soon_threadsafe and drops the OLDEST item when full (newest market
 state wins), counting every drop.
 """
 import asyncio
+import json
 import time
 
 from .clock import in_session
@@ -259,8 +260,82 @@ class AngelStreamWorker(StreamWorker):
                 pass
 
 
+# Kotak streams indices by name on the cash segments (WsToken("nse_cm", "Nifty 50")).
+# Index ticks carry the F&O underlying name so the option chain can use them as spot.
+KOTAK_INDEX_UNDERLYINGS = {
+    'nifty 50': 'NIFTY', 'nifty bank': 'BANKNIFTY', 'nifty fin service': 'FINNIFTY',
+    'nifty mid select': 'MIDCPNIFTY', 'nifty next 50': 'NIFTYNXT50', 'sensex': 'SENSEX', 'bankex': 'BANKEX',
+}
+KOTAK_SEGMENTS = {'nse_cm', 'bse_cm', 'nse_fo', 'bse_fo', 'mcx_fo'}
+KOTAK_INDEX_SEGMENTS = {'nse_cm', 'bse_cm'}
+_INDEX_EXCHANGE = {'nse_cm': 'NSE', 'bse_cm': 'BSE'}
+
+
+def _norm(name):
+    return ' '.join(str(name or '').lower().split())
+
+
+def kotak_index_underlyings():
+    """Built-in index-name -> underlying map, extended or overridden by KOTAK_INDEX_UNDERLYINGS_JSON."""
+    out = dict(KOTAK_INDEX_UNDERLYINGS)
+    try:
+        extra = json.loads(settings.kotak_index_underlyings_json or '{}')
+    except ValueError:
+        extra = {}
+    if isinstance(extra, dict):
+        out.update({_norm(k): str(v).upper() for k, v in extra.items() if v})
+    return out
+
+
+def parse_kotak_subscriptions(tokens):
+    """Split SUBSCRIPTION_JSON["KOTAK"] into (scrips, indices), each a list of (segment, token).
+
+    Scrips have numeric tokens: "nse_fo|48201", bare "48201" (nse_fo), or {"segment", "token"}.
+    Indices are named on a cash segment: "nse_cm|Nifty 50", bare "Nifty 50" (nse_cm), or
+    {"segment": "nse_cm", "token": "Nifty 50", "index": true}.
+    """
+    scrips, indices = [], []
+    for x in tokens or []:
+        if isinstance(x, dict):
+            tok = str(x.get('token', '')).strip()
+            flag = x.get('index')
+            seg = str(x.get('segment') or ('nse_cm' if flag or not tok.isdigit() else 'nse_fo')).strip().lower()
+        else:
+            raw = str(x).strip()
+            if '|' in raw:
+                seg, tok = (p.strip() for p in raw.split('|', 1))
+                seg = seg.lower()
+            else:
+                tok = raw
+                seg = 'nse_fo' if raw.isdigit() else 'nse_cm'
+            flag = None
+        if seg not in KOTAK_SEGMENTS or not tok:
+            raise StreamError(f'INVALID_KOTAK_SUBSCRIPTION:{x}')
+        is_index = flag if flag is not None else not tok.isdigit()
+        if is_index:
+            if seg not in KOTAK_INDEX_SEGMENTS:
+                raise StreamError(f'KOTAK_INDEX_NEEDS_CASH_SEGMENT:{x}')
+            indices.append((seg, tok))
+        else:
+            scrips.append((seg, tok))
+    return scrips, indices
+
+
+def kotak_index_tick(m, subscribed_name=None, underlyings=None, now_ms=None):
+    """Tick for an SFeedIndex message. The tick is keyed by the name it was subscribed with
+    (so UNDERLYING_SPOT_TOKENS_JSON can name it), has no bid/ask (an index is not traded),
+    and keeps the feed's own timestamp: a missing one stays 0 and the quality gate rejects it."""
+    name = subscribed_name or (m.name or '').strip() or m.trading_symbol or str(m.instrument_token)
+    table = underlyings if underlyings is not None else kotak_index_underlyings()
+    und = table.get(_norm(name)) or table.get(_norm(m.name))
+    seg = str(m.exchange_segment or '').lower()
+    return Tick(broker='KOTAK', exchange=_INDEX_EXCHANGE.get(seg, seg.upper()), instrument_token=name, symbol=und or name,
+                underlying=und, ltp=float(m.last_traded_price), exchange_ts_ms=_ms(m.last_trade_time),
+                receive_ts_ms=now_ms or _now())
+
+
 class KotakStreamWorker(StreamWorker):
-    SEGMENTS = {'nse_cm', 'bse_cm', 'nse_fo', 'bse_fo', 'mcx_fo'}
+    SEGMENTS = KOTAK_SEGMENTS
 
     def __init__(self, handler, tokens, session_provider, on_event=None):
         super().__init__('KOTAK', handler, on_event)
@@ -268,20 +343,16 @@ class KotakStreamWorker(StreamWorker):
         self.session_provider = session_provider  # Kotak adapter: reuse its authenticated session
 
     async def run_once(self):
-        from neo_api_client.websocket.feed import SFeedScrip, WsToken
+        from neo_api_client.websocket.feed import SFeedIndex, SFeedScrip, WsToken
+        scrips, indices = parse_kotak_subscriptions(self.tokens)
+        names = {(seg, _norm(tok)): tok for seg, tok in indices}  # packet name -> subscribed name
+        underlyings = kotak_index_underlyings()
         c = await self.session_provider()
-        kt = []
-        for x in self.tokens:
-            if isinstance(x, dict):
-                seg, tok = str(x.get('segment', 'nse_fo')).lower(), str(x.get('token', ''))
-            else:
-                raw = str(x)
-                seg, tok = raw.split('|', 1) if '|' in raw else ('nse_fo', raw)
-            if seg not in self.SEGMENTS:
-                raise StreamError('INVALID_KOTAK_SEGMENT')
-            kt.append(WsToken(seg, tok))
         async with c.create_websocket() as ws:
-            await ws.subscribe_scrips(kt)
+            if scrips:
+                await ws.subscribe_scrips([WsToken(seg, tok) for seg, tok in scrips])
+            if indices:
+                await ws.subscribe_index([WsToken(seg, tok) for seg, tok in indices])
             it = ws.__aiter__()
             while not self.stop:
                 try:
@@ -290,7 +361,12 @@ class KotakStreamWorker(StreamWorker):
                     if in_session(self.commodity):
                         raise StreamError('STREAM_STALLED')
                     continue
-                if isinstance(m, SFeedScrip):
+                if isinstance(m, SFeedIndex):
+                    self.healthy = True
+                    sub = names.get((str(m.exchange_segment).lower(), _norm(m.name))) or \
+                        names.get((str(m.exchange_segment).lower(), _norm(m.trading_symbol)))
+                    await self.handler(kotak_index_tick(m, sub, underlyings))
+                elif isinstance(m, SFeedScrip):
                     self.healthy = True
                     bid = m.buy[0].price if m.buy else 0.0
                     ask = m.sell[0].price if m.sell else 0.0

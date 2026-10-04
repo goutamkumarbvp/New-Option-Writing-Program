@@ -60,6 +60,10 @@ The web terminal's **Option Chain** tab shows a strike ladder per underlying and
   - A load is all or nothing. A failed fetch keeps the current index and retries after 60 s, 120 s … up to an hour.
   - Parsing runs in a worker thread, so a 100k-row file does not stall live ticks.
   - `POST /instruments/refresh/KOTAK` with the operator token loads now. Status is in the System tab under `instrument_loader`. Set `KOTAK_INSTRUMENT_MASTER_AUTO=false` to turn it off.
+- **Index streaming.** Subscribe indices by name on a cash segment in `SUBSCRIPTION_JSON`, for example `"nse_cm|Nifty 50"`, `"nse_cm|Nifty Bank"` and `"bse_cm|SENSEX"`. Numeric tokens stay instrument subscriptions.
+  - Index ticks carry the F&O underlying (Nifty 50 → NIFTY, Nifty Bank → BANKNIFTY, Nifty Fin Service → FINNIFTY, Nifty Mid Select → MIDCPNIFTY, Nifty Next 50 → NIFTYNXT50, SENSEX, BANKEX). Add others with `KOTAK_INDEX_UNDERLYINGS_JSON`.
+  - The Option Chain takes a live index or cash tick of the underlying as spot automatically, so `UNDERLYING_SPOT_TOKENS_JSON` is optional. It can still name the index, as `{"NIFTY": {"KOTAK": "Nifty 50"}}`, which the scenario-risk gate needs.
+  - Index ticks have no bid or ask and keep the feed's own timestamp. A tick without one is rejected by the quality gate, never stamped with local time.
 - The SDK writes `logs/neo-api-client.log` in the working directory, including mobile number and client code. `logs/` is gitignored.
 
 ## Credentialed test
