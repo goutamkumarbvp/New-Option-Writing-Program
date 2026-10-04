@@ -1,4 +1,4 @@
-# Exact versions verified by the v3.1.0 test suite on Python 3.11.
+# Exact versions verified by the v3.2.0 test suite on Python 3.11.
 # Upgrade deliberately: broker SDK field names and callback signatures are part of the contract.
 fastapi==0.142.2
 uvicorn[standard]==0.54.0

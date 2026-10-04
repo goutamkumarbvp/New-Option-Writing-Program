@@ -13,6 +13,7 @@ from app.instrument_loader import StaticInstrumentRefresher, latest_publication
 from app.instruments import InstrumentMaster
 from app.main import create_app
 from app.metrics import Exposition
+from app.version import VERSION
 
 SAMPLE = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*(\{([a-zA-Z_][a-zA-Z0-9_]*="([^"\\\n]|\\.)*",?)*\})? -?[0-9.e+-]+(inf)?$')
 
@@ -35,7 +36,7 @@ def test_metrics_endpoint_is_valid_exposition(make_terminal):
             assert SAMPLE.match(line), line
             assert line.split('{')[0].split(' ')[0] == current, f'sample outside its family: {line}'
     body = r.text
-    assert 'iort_info{version="3.1.0"} 1.0' in body and 'iort_kill_switch 0' in body and 'iort_live_trading 0' in body
+    assert f'iort_info{{version="{VERSION}"}} 1.0' in body and 'iort_kill_switch 0' in body and 'iort_live_trading 0' in body
     assert 'iort_ticks_rejected_total{reason="STALE_TICK"} 1.0' in body
     assert 'iort_broker_up{broker="ANGEL"} 1' in body and 'iort_risk_complete' in body
 

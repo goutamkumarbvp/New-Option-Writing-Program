@@ -199,8 +199,10 @@ class BarChart extends BaseChart {
       svg.append(svgEl('rect', { x: m.l + band * o.highlight, y: m.t, width: band, height: H - m.t - m.b, class: 'viz-band' }));
     }
     const every = Math.max(1, Math.ceil(46 / band));
+    const hl = o.highlight != null && o.highlight >= 0 ? o.highlight : null;
     cats.forEach((c, i) => {
-      if (i % every && i !== o.highlight) return;
+      // Regular labels every `every` bands; none may crowd the highlighted (ATM) label.
+      if (i !== hl && (i % every || (hl != null && Math.abs(i - hl) < every))) return;
       const t = svgEl('text', { x: m.l + band * (i + 0.5), y: H - 8, 'text-anchor': 'middle', class: 'viz-tick' + (i === o.highlight ? ' strong' : '') });
       t.textContent = fmtC(c); svg.append(t);
     });
