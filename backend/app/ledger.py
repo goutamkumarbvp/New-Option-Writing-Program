@@ -386,6 +386,11 @@ class Ledger:
             return {'ok': bool(x.ok), 'mismatches': json.loads(x.mismatches), 'ts': ts,
                     'age_sec': (utcnow() - ts).total_seconds()}
 
+    def order_status_counts(self):
+        from sqlalchemy import func
+        with self.Session() as s:
+            return {st: n for st, n in s.execute(select(OrderLedger.status, func.count()).group_by(OrderLedger.status))}
+
     def snapshot(self):
         from sqlalchemy import func
         with self.Session() as s:

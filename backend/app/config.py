@@ -64,6 +64,9 @@ class Settings:
     kotak_instrument_master_auto: bool = field(default_factory=lambda: _b('KOTAK_INSTRUMENT_MASTER_AUTO', True))
     kotak_scrip_segments: str = field(default_factory=lambda: _s('KOTAK_SCRIP_SEGMENTS', 'nse_cm,nse_fo,bse_fo,mcx_fo'))
     instrument_refresh_check_sec: float = field(default_factory=lambda: _f('INSTRUMENT_REFRESH_CHECK_SEC', 300))
+    # Brokers with a fixed INSTRUMENT_MASTER_URLS_JSON URL publish the day's file in the morning;
+    # the file is reloaded once after this IST time each day.
+    instrument_refresh_after_ist: str = field(default_factory=lambda: _s('INSTRUMENT_REFRESH_AFTER_IST', '08:30'))
     # Extra Kotak index-name -> F&O underlying mappings, e.g. {"Nifty IT": "NIFTYIT"} (built-ins cover
     # Nifty 50, Nifty Bank, Nifty Fin Service, Nifty Mid Select, Nifty Next 50, SENSEX, BANKEX).
     kotak_index_underlyings_json: str = field(default_factory=lambda: _s('KOTAK_INDEX_UNDERLYINGS_JSON', '{}'))

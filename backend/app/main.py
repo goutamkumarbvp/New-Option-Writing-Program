@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import Body, FastAPI, Header, WebSocket
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .audit_chain import PersistentAuditChain
@@ -23,9 +23,10 @@ from .dashboard import build_dashboard_state
 from .engine import DecisionPipeline
 from .eventbus import EventBus
 from .health_cache import HealthCache
-from .instrument_loader import KotakInstrumentLoader
+from .instrument_loader import KotakInstrumentLoader, StaticInstrumentRefresher
 from .instruments import InstrumentMaster
 from .ledger import Ledger
+from .metrics import render_metrics
 from .market import MarketDataGateway
 from .models import OrderRequest, Tick
 from .oms import OrderService
@@ -66,6 +67,7 @@ class Terminal:
         self.risk_monitor = RiskMonitor(self.brokers, self.feed, self.instruments, self.ledger, self.kill, self.emit)
         self.oms = OrderService(self)
         self.instrument_loader = KotakInstrumentLoader(self.instruments, self.brokers, self.ledger, self.emit)
+        self.static_refresher = StaticInstrumentRefresher(self.instruments, self.ledger, self.emit)
         self.chain_subscriber = ChainSubscriber(self.instruments, self.feed, self.chain, lambda: self.stream_manager,
                                                 self.risk_monitor, self.ledger)
         self.risk_monitor.executor = self.oms
@@ -146,7 +148,8 @@ class Terminal:
         await self.stream_manager.start()
         for name, coro in (('order-monitor', self.order_monitor.run()), ('risk-monitor', self.risk_monitor.run()),
                            ('reconcile', self._reconcile_loop()), ('bus-drain', self._drain_bus()),
-                           ('instrument-loader', self.instrument_loader.run()), ('chain-subscriber', self.chain_subscriber.run())):
+                           ('instrument-loader', self.instrument_loader.run()), ('chain-subscriber', self.chain_subscriber.run()),
+                           ('static-instrument-refresh', self.static_refresher.run())):
             self.tasks.append(asyncio.create_task(coro, name=name))
 
     async def stop(self):
@@ -154,6 +157,7 @@ class Terminal:
         self.risk_monitor.stop = True
         self.instrument_loader.stop = True
         self.chain_subscriber.stop = True
+        self.static_refresher.stop = True
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -428,6 +432,10 @@ def create_app(t: Terminal, run_background=True):
             pass
         finally:
             t.ws_clients.discard(q)
+
+    @app.get('/metrics')
+    async def prometheus_metrics():
+        return PlainTextResponse(await render_metrics(t), media_type='text/plain; version=0.0.4; charset=utf-8')
 
     @app.get('/ops/metrics')
     def ops_metrics():

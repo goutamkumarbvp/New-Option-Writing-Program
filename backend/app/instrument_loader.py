@@ -12,9 +12,12 @@ the configured segments together, and loads again when the files' date moves on.
   current index in place (all or nothing).
 """
 import asyncio
+import json
 import re
 import time
+from datetime import datetime, timedelta
 
+from .clock import IST
 from .config import settings
 
 MIN_RETRY_SEC, MAX_RETRY_SEC = 60, 3600
@@ -128,4 +131,96 @@ class KotakInstrumentLoader:
             except Exception as exc:  # noqa: BLE001 - the loop itself must survive
                 if self.ledger:
                     self.ledger.event('INSTRUMENT_LOADER_LOOP_ERROR', {'error': str(exc)[:200]})
+            await asyncio.sleep(settings.instrument_refresh_check_sec)
+
+
+def refresh_due_time():
+    """INSTRUMENT_REFRESH_AFTER_IST as (hour, minute); malformed values fall back to 08:30."""
+    try:
+        h, m = (int(x) for x in str(settings.instrument_refresh_after_ist).split(':', 1))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except ValueError:
+        pass
+    return 8, 30
+
+
+def latest_publication(now):
+    """Most recent instant a new daily file is expected: today's due time, or yesterday's
+    when today's has not come yet."""
+    h, m = refresh_due_time()
+    due = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return due if now >= due else due - timedelta(days=1)
+
+
+class StaticInstrumentRefresher:
+    """Reloads brokers whose INSTRUMENT_MASTER_URLS_JSON URL is fixed (Zerodha, Angel, Upstox)
+    once per day, after the broker publishes the new file. Startup still loads them first;
+    this keeps a terminal that runs overnight from trading on yesterday's master. Kotak is
+    left to KotakInstrumentLoader whenever automatic loading is on."""
+
+    def __init__(self, instruments, ledger=None, emit=None, clock=None, now=None):
+        self.instruments = instruments
+        self.ledger = ledger
+        self.emit = emit
+        self.clock = clock or time.monotonic
+        self.now = now or (lambda: datetime.now(IST))
+        self.stop = False
+        self.failures, self.retry_at, self.last, self.errors = {}, {}, {}, {}
+
+    def urls(self):
+        try:
+            m = json.loads(settings.instrument_master_urls_json or '{}')
+        except ValueError:
+            return {}
+        out = {str(b).upper(): u for b, u in (m.items() if isinstance(m, dict) else []) if u}
+        if settings.kotak_instrument_master_auto and settings.kotak_api_key:
+            out.pop('KOTAK', None)
+        return out
+
+    def due(self, broker, now):
+        if not self.instruments.loaded(broker):
+            return True
+        ts = self.instruments.loaded_at.get(broker)
+        return ts is None or datetime.fromtimestamp(ts, tz=IST) < latest_publication(now)
+
+    def status(self):
+        now = self.clock()
+        return {b: {'loaded': self.instruments.loaded(b), 'consecutive_failures': self.failures.get(b, 0),
+                    'retry_in_sec': max(0, round(self.retry_at.get(b, 0) - now)), 'last': self.last.get(b),
+                    'last_error': self.errors.get(b)} for b in self.urls()}
+
+    async def _event(self, kind, payload):
+        if self.ledger:
+            self.ledger.event(kind, payload)
+        if self.emit:
+            await self.emit({'type': kind, 'payload': payload})
+
+    async def run_once(self):
+        now, results = self.now(), {}
+        for b, url in self.urls().items():
+            if not self.due(b, now) or self.clock() < self.retry_at.get(b, 0):
+                continue
+            try:
+                r = await self.instruments.load_url(url, b)
+            except Exception as exc:  # noqa: BLE001 - keep the current index and back off
+                self.failures[b] = self.failures.get(b, 0) + 1
+                delay = min(MIN_RETRY_SEC * 2 ** (self.failures[b] - 1), MAX_RETRY_SEC)
+                self.retry_at[b], self.errors[b] = self.clock() + delay, str(exc)[:300]
+                await self._event('INSTRUMENT_MASTER_LOAD_ERROR', {'broker': b, 'error': self.errors[b], 'retry_in_sec': delay})
+                results[b] = {'status': 'ERROR', 'error': self.errors[b], 'retry_in_sec': delay}
+                continue
+            self.failures[b], self.retry_at[b], self.errors[b] = 0, 0.0, None
+            self.last[b] = {'count': r['count'], 'at': time.time()}
+            await self._event('INSTRUMENT_MASTER_LOADED', {'broker': b, 'count': r['count'], 'source': 'STATIC_URL'})
+            results[b] = {'status': 'LOADED', 'count': r['count']}
+        return results
+
+    async def run(self):
+        while not self.stop:
+            try:
+                await self.run_once()
+            except Exception as exc:  # noqa: BLE001 - the loop itself must survive
+                if self.ledger:
+                    self.ledger.event('INSTRUMENT_REFRESH_LOOP_ERROR', {'error': str(exc)[:200]})
             await asyncio.sleep(settings.instrument_refresh_check_sec)
