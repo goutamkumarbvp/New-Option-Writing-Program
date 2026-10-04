@@ -32,6 +32,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Cache-Control'] = 'no-store'
-        response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-                                                       "style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; frame-ancestors 'none'")
+        # Scripts only from this origin (no inline script or handlers anywhere in the UI);
+        # inline style attributes remain for data-driven bars and heatmap cells.
+        response.headers['Content-Security-Policy'] = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                                                       "img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; "
+                                                       "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
         return response

@@ -149,5 +149,7 @@ def test_option_chain_endpoints(make_terminal):
 
 def test_frontend_has_option_chain_tab(make_terminal):
     t, _ = make_terminal()
-    html = TestClient(create_app(t, run_background=False)).get('/').text
-    assert 'id="chain"' in html and "'Option Chain'" in html and '/option-chain' in html
+    c = TestClient(create_app(t, run_background=False))
+    html = c.get('/').text
+    assert 'id="chain"' in html and '/static/js/chain.js' in html and 'onclick=' not in html
+    assert "'Option Chain'" in c.get('/static/js/core.js').text and '/option-chain' in c.get('/static/js/chain.js').text

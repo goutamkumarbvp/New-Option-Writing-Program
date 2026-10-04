@@ -13,6 +13,7 @@ from typing import Literal, Optional
 
 from fastapi import Body, FastAPI, Header, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .audit_chain import PersistentAuditChain
@@ -193,6 +194,9 @@ def create_app(t: Terminal, run_background=True):
     app = FastAPI(title='Institutional Options Risk Terminal', version=VERSION, lifespan=lifespan)
     app.add_middleware(SecurityMiddleware)
     app.state.terminal = t
+    front = _frontend()
+    if front:
+        app.mount('/static', StaticFiles(directory=str(front.parent)), name='static')  # UI stylesheet and script modules
 
     def denied():
         return JSONResponse({'status': 'BLOCKED', 'reason': 'OPERATOR_AUTH_REQUIRED'}, status_code=401)
