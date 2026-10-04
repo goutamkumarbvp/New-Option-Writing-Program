@@ -66,10 +66,12 @@ def test_iron_condor_is_bounded_both_ways():
 
 def test_today_curve_passes_through_current_pnl_and_pop_matches_breakevens():
     exp = expiry_in(14)
-    legs = [leg(-75, 25000, 'CE', exp, iv=IV), leg(-75, 25000, 'PE', exp, iv=IV)]
-    c = payoff_curves(legs, S, points=121, base_pnl=1234.0)
-    assert c['complete'] and c['today'][60] == pytest.approx(1234.0, abs=0.5)
     T = years_to_expiry(exp)
+    # Exact model prices: a 2-decimal rounded mark would offset T+0 by up to 75 x 0.005 per leg.
+    exact = {typ: bs_price(S, 25000, T, settings.risk_free_rate, IV, typ) for typ in ('CE', 'PE')}
+    legs = [leg(-75, 25000, 'CE', exp, price=exact['CE'], iv=IV), leg(-75, 25000, 'PE', exp, price=exact['PE'], iv=IV)]
+    c = payoff_curves(legs, S, points=121, base_pnl=1234.0)
+    assert c['complete'] and c['today'][60] == pytest.approx(1234.0, abs=0.05)
     pop = probability_of_profit(legs, S, IV, T)
     lo, hi = expiry_payoff_stats(legs)['breakevens']
     assert pop == pytest.approx(probability_above(S, lo, IV, T) - probability_above(S, hi, IV, T), abs=1e-4)
