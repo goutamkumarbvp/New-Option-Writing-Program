@@ -29,6 +29,13 @@ services:
     env_file: .env
     environment:
       DATA_DIR: /app/data
+      # Broker secrets pass through from the host environment (export them or use a secret
+      # manager) so they never need to sit in .env. A host value overrides the .env value.
+      KOTAK_API_KEY: ${KOTAK_API_KEY:-}
+      KOTAK_MOBILE: ${KOTAK_MOBILE:-}
+      KOTAK_CLIENT_CODE: ${KOTAK_CLIENT_CODE:-}
+      KOTAK_MPIN: ${KOTAK_MPIN:-}
+      KOTAK_TOTP_SECRET: ${KOTAK_TOTP_SECRET:-}
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}

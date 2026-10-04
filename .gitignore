@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 data/
 logs/
+reports/live_gate_*.json

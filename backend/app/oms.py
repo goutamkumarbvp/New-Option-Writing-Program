@@ -339,6 +339,33 @@ class OrderService:
         return out
 
     # --------------------------------------------------- cancel-all / flatten
+    async def cancel_order(self, client_order_id, actor):
+        """Cancel one working order at its broker. Risk-reducing, so the kill switch does not
+        block it. The ledger status moves when the order monitor reads the broker's book;
+        this call records the request and returns the broker's answer."""
+        t = self.t
+        o = t.ledger.get_order(client_order_id)
+        if not o:
+            return 404, {'status': 'NOT_FOUND'}
+        if o['status'] not in ('SUBMITTED', 'OPEN', 'PARTIAL'):
+            return 409, {'status': 'BLOCKED', 'reason': 'ORDER_NOT_WORKING', 'order_status': o['status']}
+        if not o.get('broker_order_id'):
+            return 409, {'status': 'BLOCKED', 'reason': 'BROKER_ORDER_ID_UNKNOWN'}
+        try:
+            broker = t.brokers.get(o['broker'])
+        except KeyError:
+            return 404, {'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}
+        try:
+            resp = await broker.cancel(o['broker_order_id'])
+        except Exception as exc:  # noqa: BLE001 - the order may still be live; report, never assume
+            resp = {'status': 'CANCEL_FAILED', 'error': f'{type(exc).__name__}:{str(exc)[:160]}'}
+        payload = {'client_order_id': client_order_id, 'broker': o['broker'], 'broker_order_id': o['broker_order_id'],
+                   'symbol': o['symbol'], 'result': resp.get('status')}
+        t.ledger.event('ORDER_CANCEL_REQUEST', {**payload, 'response': resp})
+        t.audit.append('ORDER_CANCEL_REQUEST', actor, payload)
+        await t.emit({'type': 'ORDER_CANCEL_REQUEST', 'payload': payload})
+        return (200 if resp.get('status') == 'CANCEL_REQUESTED' else 502), {**payload, 'response': resp}
+
     async def cancel_all_brokers(self, actor):
         out = {}
         for b in self.t.brokers.configured():

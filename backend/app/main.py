@@ -301,6 +301,14 @@ def create_app(t: Terminal, run_background=True):
             return JSONResponse({'status': 'NOT_FOUND'}, status_code=404)
         return {'order': o, 'fills': t.ledger.fills_for(client_order_id)}
 
+    @app.post('/orders/{client_order_id}/cancel')
+    async def cancel_order(client_order_id: str, x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Cancel one working order at its broker (operator control, audited)."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        code, body = await t.oms.cancel_order(client_order_id, 'OPERATOR')
+        return JSONResponse(body, status_code=code)
+
     @app.post('/orders/{client_order_id}/resolve')
     def resolve_order(client_order_id: str, body: ResolveRequest, x_iort_operator_token: Optional[str] = Header(default=None)):
         """Operator resolution of an ambiguous order after checking the broker terminal."""

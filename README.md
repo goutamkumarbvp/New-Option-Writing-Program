@@ -98,6 +98,12 @@ The **Strategy** tab and `GET /strategy/template/{exchange}/{underlying}/{expiry
   - Status is on the Market tab.
 - The SDK writes `logs/neo-api-client.log` in the working directory, including mobile number and client code. `logs/` is gitignored.
 
+## Credentials
+Broker credentials never go in chat, git or `.env`. Set them as environment variables: `KOTAK_API_KEY`, `KOTAK_MOBILE`, `KOTAK_CLIENT_CODE`, `KOTAK_MPIN` and `KOTAK_TOTP_SECRET`.
+- In a cloud session, add them in the environment settings.
+- On a server, use its secret store or export them before `docker compose up`; compose passes them through to the terminal.
+- Process environment variables take precedence over `.env`.
+
 ## Credentialed test
 Keep `LIVE_TRADING=false` and run:
 `python scripts/credentialed_live_certification.py`
@@ -106,3 +112,5 @@ The script is read-only. It does not place, modify or cancel orders.
 
 ## Live-money gate
 The final gate still requires controlled live evidence: real feed, real instrument master, broker reconciliation, margin evidence, small-size order acknowledgement, fill/rejection/cancel lifecycle, emergency exit, kill-switch test, recovery test and operator sign-off.
+
+`scripts/live_gate.py` runs the automatable parts (preflight, one tiny resting buy plus cancel, kill-switch and reject paths, restart recovery) and writes an evidence report. See `scripts/CONTROLLED_LIVE_TEST.md`. Working orders can be cancelled one at a time from the Orders tab or with `POST /orders/{client_order_id}/cancel` (operator token, audited).
