@@ -13,8 +13,9 @@ import csv
 import gzip
 import io
 import json
+import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -54,7 +55,74 @@ def _opt(v):
     return v if v in ('CE', 'PE') else None
 
 
-def normalize_row(broker, r):
+# Kotak pExpiryDate is seconds. The official SDK (neo_api_client/services/scrip_search.py)
+# adds 315511200 s for every *_fo segment except bse_fo and mcx_fo, which are plain Unix
+# seconds, and formats the result as a UTC date. Decoding follows that rule exactly.
+KOTAK_FO_EPOCH_OFFSET = 315511200
+_MONTHS = ('JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC')
+_WEEKLY_MONTH = '123456789OND'  # NSE weekly symbols: 1-9 for Jan-Sep, O/N/D for Oct-Dec
+
+
+def symbol_expiry_hint(symbol, underlying, strike=None):
+    """Expiry evidence carried by an exchange trading symbol, used to cross-check a decoded date.
+
+    Monthly  NIFTY26OCT25000CE / NIFTY26OCTFUT -> ('MONTH', (2026, 10))
+    Weekly   NIFTY26O0625000CE                -> ('DATE', date(2026, 10, 6))
+    Returns None when the symbol does not follow either pattern (nothing to check against).
+    """
+    s, u = str(symbol or '').upper().replace(' ', ''), str(underlying or '').upper().replace(' ', '')
+    if not u or not s.startswith(u):
+        return None
+    rest = s[len(u):]
+    m = re.fullmatch(r'(\d{2})([A-Z]{3})(?:FUT|(\d+(?:\.\d+)?)(?:CE|PE))', rest)
+    if m and m.group(2) in _MONTHS:
+        if m.group(3) and strike and abs(float(m.group(3)) - strike) > 1e-6:
+            return None
+        return ('MONTH', (2000 + int(m.group(1)), _MONTHS.index(m.group(2)) + 1))
+    m = re.fullmatch(r'(\d{2})([1-9OND])(\d{2})(\d+(?:\.\d+)?)(?:CE|PE)', rest)
+    if m and strike and abs(float(m.group(4)) - strike) < 1e-6:
+        try:
+            return ('DATE', date(2000 + int(m.group(1)), _WEEKLY_MONTH.index(m.group(2)) + 1, int(m.group(3))))
+        except ValueError:
+            return None
+    return None
+
+
+def kotak_expiry(raw, segment, symbol=None, underlying=None, strike=None, today=None):
+    """ISO expiry date from a Kotak scrip-master row, or None (fail closed).
+
+    The SDK rule is tried first. A decoded date must fall between 31 days before and six
+    years after `today` (a wrong epoch convention lands about ten years off), and must agree
+    with the trading symbol's month or weekly date when the symbol carries one. The other
+    epoch convention is accepted only when the symbol positively confirms it.
+    """
+    n = _f(raw)
+    if not n or n <= 0:
+        return None
+    seg = str(segment or '').strip().lower()
+    sdk_offset = seg.endswith('_fo') and seg not in ('bse_fo', 'mcx_fo')
+    candidates = (n + KOTAK_FO_EPOCH_OFFSET, n) if sdk_offset else (n, n + KOTAK_FO_EPOCH_OFFSET)
+    today = today or datetime.now(IST).date()
+    lo, hi = today - timedelta(days=31), today + timedelta(days=6 * 366)
+    hint = symbol_expiry_hint(symbol, underlying, strike)
+    for i, secs in enumerate(candidates):
+        try:
+            d = datetime.fromtimestamp(secs, tz=timezone.utc).date()
+        except (OverflowError, OSError, ValueError):
+            continue
+        if not lo <= d <= hi:
+            continue
+        if hint is None:
+            if i == 0:
+                return d.isoformat()
+            continue
+        kind, value = hint
+        if (kind == 'DATE' and d == value) or (kind == 'MONTH' and (d.year, d.month) == value):
+            return d.isoformat()
+    return None
+
+
+def normalize_row(broker, r, today=None):
     b = broker.upper()
     if b == 'ZERODHA':
         return {'token': str(r.get('instrument_token', '')), 'symbol': r.get('tradingsymbol', ''),
@@ -78,14 +146,18 @@ def normalize_row(broker, r):
                 'strike': _f(r.get('strike_price')) or None, 'option_type': _opt(r.get('instrument_type')),
                 'lot_size': int(_f(r.get('lot_size')) or 1), 'tick_size': None, 'instrument_type': r.get('instrument_type')}
     if b == 'KOTAK':
-        # Kotak's expiry encoding is not documented in the SDK, so expiry stays None
-        # and option-specific gates fail closed for Kotak until it is verified.
+        # Kotak CSV headers carry stray spaces; the SDK strips them before reading columns.
+        # Strike is in paise. Expiry is decoded by kotak_expiry() and stays None when the
+        # decoded date fails its checks, so option-specific gates still fail closed.
+        r = {str(k).strip(): v for k, v in r.items()}
         strike = _f(r.get('dStrikePrice;') or r.get('dStrikePrice'))
-        return {'token': str(r.get('pSymbol', '')), 'symbol': r.get('pTrdSymbol', ''),
-                'exchange': _EXCH.get(str(r.get('pExchSeg', '')).upper(), ''), 'underlying': r.get('pSymbolName') or None,
-                'expiry': None, 'strike': strike / 100 if strike and strike > 0 else None,
-                'option_type': _opt(r.get('pOptionType')), 'lot_size': int(_f(r.get('lLotSize')) or 1), 'tick_size': None,
-                'instrument_type': r.get('pInstType')}
+        strike = strike / 100 if strike and strike > 0 else None
+        symbol, underlying = str(r.get('pTrdSymbol') or '').strip(), (str(r.get('pSymbolName') or '').strip() or None)
+        seg = str(r.get('pExchSeg', '')).strip()
+        return {'token': str(r.get('pSymbol', '')).strip(), 'symbol': symbol, 'exchange': _EXCH.get(seg.upper(), ''),
+                'underlying': underlying, 'expiry': kotak_expiry(r.get('pExpiryDate'), seg, symbol, underlying, strike, today),
+                'strike': strike, 'option_type': _opt(r.get('pOptionType')), 'lot_size': int(_f(r.get('lLotSize')) or 1),
+                'tick_size': None, 'instrument_type': r.get('pInstType')}
     raise ValueError(f'UNKNOWN_BROKER:{broker}')
 
 
@@ -108,7 +180,8 @@ class InstrumentMaster:
         self.loaded_at[b] = loaded_at
 
     def load_rows(self, broker, raw_rows):
-        records = [normalize_row(broker, r) for r in raw_rows if isinstance(r, dict)]
+        today = datetime.now(IST).date()
+        records = [normalize_row(broker, r, today) for r in raw_rows if isinstance(r, dict)]
         now = time.time()
         self._install(broker, records, now)
         (self.dir / f'instruments_{broker.upper()}.json').write_text(

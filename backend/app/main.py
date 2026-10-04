@@ -331,6 +331,23 @@ def create_app(t: Terminal, run_background=True):
         await t.emit({'type': 'RECONCILIATION', 'broker': b.name, 'payload': result})
         return result
 
+    @app.post('/brokers/{broker}/login-reset')
+    async def broker_login_reset(broker: str, x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Clear a broker's login halt/backoff after the operator has fixed the credentials."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        b = broker_or_404(broker)
+        if b is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        if not hasattr(b, 'reset_login'):
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'LOGIN_RESET_UNSUPPORTED'}, status_code=400)
+        before = b.login_state()
+        after = b.reset_login()
+        t.health.at = 0.0  # next health read reflects the reset instead of the cached halt
+        t.ledger.event('BROKER_LOGIN_RESET', {'broker': b.name, 'before': before})
+        t.audit.append('BROKER_LOGIN_RESET', 'OPERATOR', {'broker': b.name, 'was_halted': before['halted']})
+        return {'status': 'RESET', 'broker': b.name, 'before': before, 'login': after}
+
     @app.post('/instruments/load/{broker}')
     async def load_instruments(broker: str, url: str = Body(embed=True), x_iort_operator_token: Optional[str] = Header(default=None)):
         if not require_control_operator(x_iort_operator_token):

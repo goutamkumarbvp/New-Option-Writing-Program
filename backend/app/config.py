@@ -113,6 +113,12 @@ class Settings:
     kotak_totp_secret: str = field(default_factory=lambda: _s('KOTAK_TOTP_SECRET'))
     kotak_mpin: str = field(default_factory=lambda: _s('KOTAK_MPIN'))
     kotak_session_ttl_sec: int = field(default_factory=lambda: _i('KOTAK_SESSION_TTL_SEC', 6 * 3600))
+    # Login backoff: failed logins wait base * 2^(n-1) seconds (capped) before the next attempt.
+    # Credential rejections (wrong MPIN/TOTP) halt automatic login after this many in a row,
+    # so the terminal cannot lock the account; an operator reset or a restart clears the halt.
+    kotak_login_backoff_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_BACKOFF_SEC', 30))
+    kotak_login_backoff_max_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_BACKOFF_MAX_SEC', 900))
+    kotak_login_max_rejections: int = field(default_factory=lambda: _i('KOTAK_LOGIN_MAX_REJECTIONS', 2))
 
     def validation_errors(self):
         """Configuration errors that must stop live trading."""

@@ -156,7 +156,8 @@ function render(s){const sys=s.system||{};$('ver').textContent='v'+(s.version||'
  $('conn').textContent='CONNECTED';cls($('conn'),'ok');
  const agg=(s.risk||{}).aggregate||{};$('ovPnl').textContent=`${fmt(agg.total_pnl)} / ${fmt(agg.day_pnl)}`;cls($('ovPnl'),(agg.total_pnl||0)<0?'bad':'ok');
  const rd=s.readiness||{};$('ovReadyFlag').textContent=rd.ready?'READY':'BLOCKED';cls($('ovReadyFlag'),rd.ready?'ok':'bad');$('ovReady').textContent=(rd.reasons||[]).join('\n')||'none';
- $('ovBrokers').innerHTML=(s.brokers||[]).map(b=>metric(b.broker,b.status||'UNKNOWN',b.status==='LIVE'?'ok':b.status==='UNCONFIGURED'?'':'bad')).join('')||'<span class="muted">No broker data</span>';
+ $('ovBrokers').innerHTML=(s.brokers||[]).map(b=>metric(b.broker,b.status||'UNKNOWN',b.status==='LIVE'?'ok':b.status==='UNCONFIGURED'?'':'bad')
+  +(b.error?`<div class="muted bad">${esc(b.error)}</div>`:'')+(b.status==='LOGIN_HALTED'?`<div class="control" style="margin:6px 0"><button class="action amber" onclick="loginReset('${esc(b.broker)}')">Reset ${esc(b.broker)} login</button><span class="muted">Fix the credentials first. Needs the operator token from the Execution tab.</span></div>`:'')).join('')||'<span class="muted">No broker data</span>';
  $('excRows').innerHTML=(s.exceptions||[]).map(o=>`<tr><td>${esc(o.client_order_id)}</td><td>${esc(o.broker)}</td><td>${esc(o.symbol)}</td><td>${esc(o.side)}</td><td>${esc(o.qty)}</td><td class="bad">${esc(o.status)}</td><td>${esc(o.last_reason)}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">None</td></tr>';
  $('marketRows').innerHTML=(s.market?.last_ticks||[]).map(t=>`<tr><td>${esc(t.broker)}</td><td>${esc(t.instrument_token)}</td><td>${esc(t.exchange)}</td><td>${esc(t.symbol)}</td><td>${esc(t.ltp)}</td><td>${esc(t.bid)}</td><td>${esc(t.ask)}</td><td>${esc(t.oi)}</td><td>${t.exchange_ts_ms?esc(new Date(t.exchange_ts_ms).toLocaleTimeString()):'—'}</td></tr>`).join('');
  const st=s.market?.stats||{};$('marketQuality').innerHTML=metric('Accepted ticks',st.accepted??0)+Object.entries(st.rejected_by_reason||{}).map(([r,n])=>metric('Rejected: '+r,n,'warn')).join('')+metric('Live brokers',(st.live_brokers||[]).join(', ')||'none');
@@ -180,6 +181,7 @@ const panic=()=>control('/kill?reason=UI_PANIC');
 function resetKill(){const why=$('resetWhy').value.trim();if(why.length<3){alert('Give a reset reason');return}if(confirm('Reset the kill switch? New orders become possible again.'))control('/kill/reset?reason='+encodeURIComponent(why))}
 function emergency(){const b=$('esBroker').value,f=$('esFlatten').checked;if(confirm(`Emergency stop ${b}${f?' AND FLATTEN ALL POSITIONS':''}?`))control(`/emergency-stop/${b}?flatten=${f}`)}
 const reconcileNow=()=>control('/reconcile/'+$('esBroker').value);
+function loginReset(b){if(confirm(`Reset the ${b} login halt? The terminal will try to log in again with the configured credentials.`))control(`/brokers/${b}/login-reset`)}
 
 // ---------------------------------------------------------------- option chain
 // Read-only view of /option-chain/.../ladder. Orders from the ticket go to POST /orders,

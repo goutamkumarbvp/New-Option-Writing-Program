@@ -36,6 +36,23 @@ def classify_exception(exc):
     return 'UNKNOWN', 'AMBIGUOUS:' + type(exc).__name__
 
 
+def login_failure_kind(exc):
+    """REJECTED when the broker answered and refused (4xx other than timeout/rate limit),
+    which counts toward account lockout; TRANSPORT for network, proxy, timeout, rate-limit
+    and server errors, which never reached credential checks. The Kotak SDK reports
+    connection-level failures (including a proxy refusing the tunnel) with status 0."""
+    status = getattr(exc, 'status', None)
+    if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429):
+        return 'REJECTED'
+    return 'TRANSPORT'
+
+
+def totp_wait(now, step=30, guard=3.0):
+    """Seconds to wait so a fresh TOTP code has at least `guard` seconds of validity left."""
+    remaining = step - (now % step)
+    return remaining + 0.25 if remaining < guard else 0.0
+
+
 def classify_http(code):
     if 200 <= code < 300:
         return None
@@ -321,11 +338,18 @@ class Kotak(BaseBroker):
     name = 'KOTAK'
     ORDER_TYPE = {'MARKET': 'MKT', 'LIMIT': 'L', 'SL': 'SL', 'SL-M': 'SL-M'}
 
-    def __init__(self, transport=None):
+    def __init__(self, transport=None, client_factory=None, clock=None):
         super().__init__(transport)
         self._session = None
         self._session_at = 0.0
         self._lock = asyncio.Lock()
+        self._factory = client_factory  # tests inject a fake NeoAPI; production imports the SDK lazily
+        self._clock = clock or time.monotonic
+        self._failures = 0          # consecutive failed logins of any kind
+        self._rejections = 0        # consecutive logins Kotak itself refused (credential risk)
+        self._retry_at = 0.0        # monotonic time before which no login is attempted
+        self._halted = False
+        self._last_error = None
 
     def configured(self):
         return bool(settings.kotak_api_key and settings.kotak_mobile and settings.kotak_client_code
@@ -334,6 +358,37 @@ class Kotak(BaseBroker):
     def _code(self):
         return totp(settings.kotak_totp_secret) if settings.kotak_totp_secret else settings.kotak_totp
 
+    # ------------------------------------------------------------- login backoff
+    # The risk monitor, order monitor, reconciler, health check and stream worker all
+    # call session(). Without backoff a failing login was retried about once a second,
+    # and each credential rejection counts toward Kotak's account lockout.
+    def login_state(self):
+        now = self._clock()
+        return {'halted': self._halted, 'consecutive_failures': self._failures, 'consecutive_rejections': self._rejections,
+                'retry_in_sec': max(0, round(self._retry_at - now)) if self._retry_at > now else 0,
+                'last_error': self._last_error}
+
+    def reset_login(self):
+        """Operator action: clear the halt and backoff so the next call logs in immediately."""
+        self._failures = self._rejections = 0
+        self._retry_at, self._halted, self._last_error = 0.0, False, None
+        return self.login_state()
+
+    def _login_failed(self, kind, detail):
+        self._failures += 1
+        self._last_error = f'{kind}:{detail}'[:200]
+        if kind == 'REJECTED':
+            self._rejections += 1
+            if self._rejections >= max(1, settings.kotak_login_max_rejections):
+                self._halted = True
+        else:
+            self._rejections = 0  # only consecutive refusals by Kotak count toward the halt
+        delay = min(settings.kotak_login_backoff_sec * 2 ** (self._failures - 1), settings.kotak_login_backoff_max_sec)
+        self._retry_at = self._clock() + delay
+        if self._halted:
+            return RuntimeError(f'KOTAK_LOGIN_HALTED:{self._rejections}_REJECTIONS:{self._last_error}')
+        return RuntimeError(f'KOTAK_LOGIN_{kind}:retry_in={round(delay)}s:{detail}'[:200])
+
     async def session(self, force=False):
         async with self._lock:
             fresh = self._session and time.time() - self._session_at < settings.kotak_session_ttl_sec
@@ -341,14 +396,33 @@ class Kotak(BaseBroker):
                 return self._session
             if not self.configured():
                 raise RuntimeError('KOTAK_CREDENTIALS_MISSING')
-            from neo_api_client import NeoAPI
-            c = NeoAPI(consumer_key=settings.kotak_api_key, environment='prod')
-            for step in (lambda: c.totp_login(mobile_number=settings.kotak_mobile, ucc=settings.kotak_client_code, totp=self._code()),
-                         lambda: c.totp_validate(mpin=settings.kotak_mpin)):
-                resp = await asyncio.to_thread(step)
-                if not isinstance(resp, dict) or 'error' in resp or 'Error' in resp:
-                    raise RuntimeError('KOTAK_LOGIN_FAILED')
+            # Backoff applies to forced logins too: force must never bypass lockout protection.
+            if self._halted:
+                raise RuntimeError(f'KOTAK_LOGIN_HALTED:{self._rejections}_REJECTIONS:operator reset required:{self._last_error}')
+            wait = self._retry_at - self._clock()
+            if wait > 0:
+                raise RuntimeError(f'KOTAK_LOGIN_BACKOFF:retry_in={round(wait)}s:{self._last_error}')
+            if settings.kotak_totp_secret:
+                await asyncio.sleep(totp_wait(time.time()))  # do not send a code that expires in transit
+            factory = self._factory
+            if factory is None:
+                from neo_api_client import NeoAPI as factory
+            try:
+                c = factory(consumer_key=settings.kotak_api_key, environment='prod')
+            except Exception as exc:  # noqa: BLE001 - SDK construction failed; nothing reached Kotak's auth
+                raise self._login_failed('TRANSPORT', type(exc).__name__) from exc
+            for name, step in (('TOTP', lambda: c.totp_login(mobile_number=settings.kotak_mobile, ucc=settings.kotak_client_code,
+                                                             totp=self._code())),
+                               ('MPIN', lambda: c.totp_validate(mpin=settings.kotak_mpin))):
+                try:
+                    resp = await asyncio.to_thread(step)
+                except Exception as exc:  # noqa: BLE001
+                    raise self._login_failed(login_failure_kind(exc), f'{name}:{type(exc).__name__}:{str(exc)[:80]}') from exc
+                if not isinstance(resp, dict) or 'error' in resp or 'Error' in resp or not isinstance(resp.get('data'), dict):
+                    raise self._login_failed('REJECTED', f'{name}:{str(resp)[:100]}')
             self._session, self._session_at = c, time.time()
+            self._failures = self._rejections = 0
+            self._retry_at, self._last_error = 0.0, None
             return c
 
     async def _call(self, fn_name, **kw):
@@ -366,7 +440,8 @@ class Kotak(BaseBroker):
             await self.session()
             return {'broker': self.name, 'status': 'LIVE', 'sdk': 'kotakneoapi'}
         except Exception as exc:  # noqa: BLE001
-            return {'broker': self.name, 'status': 'AUTH_ERROR', 'error': str(exc)[:120]}
+            return {'broker': self.name, 'status': 'LOGIN_HALTED' if self._halted else 'AUTH_ERROR', 'error': str(exc)[:160],
+                    'login': self.login_state()}
 
     async def raw_orders(self):
         return await self._call('order_report')
