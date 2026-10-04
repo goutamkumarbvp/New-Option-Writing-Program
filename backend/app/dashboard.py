@@ -44,6 +44,7 @@ async def build_dashboard_state(t):
         'option_chain': {'chains': t.chain.chains()[:100]},
         'instruments': t.instruments.summary(),
         'instrument_loader': t.instrument_loader.status() if getattr(t, 'instrument_loader', None) else None,
+        'chain_subscriber': t.chain_subscriber.state if getattr(t, 'chain_subscriber', None) else None,
         'risk': {
             'limits': {'hard_sl': s.portfolio_hard_sl, 'soft_sl': s.portfolio_soft_sl, 'max_daily_loss': s.max_daily_loss,
                        'max_exposure': s.max_net_exposure, 'max_short_option_notional': s.max_short_option_notional,

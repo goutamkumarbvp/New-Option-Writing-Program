@@ -75,17 +75,18 @@ class MarketDataGateway:
         t = self.tick(broker, token)
         return bool(t) and now_ms() - int(t.receive_ts_ms or 0) <= settings.data_stale_ms
 
-    def live_spot(self, underlying):
-        """Freshest live tick of the underlying itself: an index or cash instrument carrying
-        this underlying name with no expiry, strike or option type. Futures and options are
-        excluded. None when no such tick is live."""
+    def live_spot(self, underlying, fresh_only=True):
+        """Freshest tick of the underlying itself: an index or cash instrument carrying this
+        underlying name with no expiry, strike or option type. Futures and options are
+        excluded. fresh_only=False also returns a stale tick (good enough to centre a strike
+        window, never to price). None when there is no such tick."""
         u = str(underlying or '').upper()
         if not u:
             return None
         best = None
         for t in self.last.values():
             if (str(t.underlying or '').upper() == u and t.expiry is None and t.strike is None and t.option_type is None
-                    and t.ltp > 0 and self.live_instrument(t.broker, t.instrument_token)
+                    and t.ltp > 0 and (not fresh_only or self.live_instrument(t.broker, t.instrument_token))
                     and (best is None or (t.receive_ts_ms or 0) > (best.receive_ts_ms or 0))):
                 best = t
         return best

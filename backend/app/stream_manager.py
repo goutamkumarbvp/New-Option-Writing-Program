@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from .broker_streams import AngelStreamWorker, KotakStreamWorker, UpstoxStreamWorker, ZerodhaStreamWorker
+from .chain_subscriber import auto_chain_config
 from .config import settings
 
 
@@ -30,8 +31,9 @@ class StreamManager:
             self.workers.append(UpstoxStreamWorker(self.on_tick, s['UPSTOX'], self.on_event))
         if settings.angel_access_token and settings.angel_api_key and s.get('ANGEL'):
             self.workers.append(AngelStreamWorker(self.on_tick, s['ANGEL'], self.on_event))
-        if self.registry and 'KOTAK' in self.registry.items and self.registry.get('KOTAK').configured() and s.get('KOTAK'):
-            self.workers.append(KotakStreamWorker(self.on_tick, s['KOTAK'], self.registry.get('KOTAK').session, self.on_event))
+        # Kotak also runs with only KOTAK_AUTO_CHAIN_JSON: the chain subscriber feeds it tokens at runtime.
+        if self.registry and 'KOTAK' in self.registry.items and self.registry.get('KOTAK').configured() and (s.get('KOTAK') or auto_chain_config()):
+            self.workers.append(KotakStreamWorker(self.on_tick, s.get('KOTAK') or [], self.registry.get('KOTAK').session, self.on_event))
 
     async def start(self):
         self.build()
@@ -50,4 +52,5 @@ class StreamManager:
 
     def status(self):
         return [{'broker': w.broker, 'running': w.running, 'healthy': w.healthy, 'last_error': w.last_error,
-                 'reconnects': w.reconnects, 'dropped': w.bridge.dropped if w.bridge else 0} for w in self.workers]
+                 'reconnects': w.reconnects, 'dropped': w.bridge.dropped if w.bridge else 0,
+                 'dynamic_tokens': len(getattr(w, 'dynamic', ()))} for w in self.workers]

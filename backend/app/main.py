@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .audit_chain import PersistentAuditChain
 from .brokers import BrokerRegistry
+from .chain_subscriber import ChainSubscriber
 from .config import settings
 from .dashboard import build_dashboard_state
 from .engine import DecisionPipeline
@@ -63,6 +64,8 @@ class Terminal:
         self.risk_monitor = RiskMonitor(self.brokers, self.feed, self.instruments, self.ledger, self.kill, self.emit)
         self.oms = OrderService(self)
         self.instrument_loader = KotakInstrumentLoader(self.instruments, self.brokers, self.ledger, self.emit)
+        self.chain_subscriber = ChainSubscriber(self.instruments, self.feed, self.chain, lambda: self.stream_manager,
+                                                self.risk_monitor, self.ledger)
         self.risk_monitor.executor = self.oms
         self.readiness = ProductionReadiness(self.feed, self.health, self.watchdog, self.kill, self.instruments, None, self.ledger,
                                              self.bus, self.risk_monitor, self.order_monitor)
@@ -141,13 +144,14 @@ class Terminal:
         await self.stream_manager.start()
         for name, coro in (('order-monitor', self.order_monitor.run()), ('risk-monitor', self.risk_monitor.run()),
                            ('reconcile', self._reconcile_loop()), ('bus-drain', self._drain_bus()),
-                           ('instrument-loader', self.instrument_loader.run())):
+                           ('instrument-loader', self.instrument_loader.run()), ('chain-subscriber', self.chain_subscriber.run())):
             self.tasks.append(asyncio.create_task(coro, name=name))
 
     async def stop(self):
         self.order_monitor.stop = True
         self.risk_monitor.stop = True
         self.instrument_loader.stop = True
+        self.chain_subscriber.stop = True
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

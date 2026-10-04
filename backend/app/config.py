@@ -67,6 +67,11 @@ class Settings:
     # Extra Kotak index-name -> F&O underlying mappings, e.g. {"Nifty IT": "NIFTYIT"} (built-ins cover
     # Nifty 50, Nifty Bank, Nifty Fin Service, Nifty Mid Select, Nifty Next 50, SENSEX, BANKEX).
     kotak_index_underlyings_json: str = field(default_factory=lambda: _s('KOTAK_INDEX_UNDERLYINGS_JSON', '{}'))
+    # Option strikes kept subscribed around spot, per underlying:
+    # {"NIFTY": {"expiries": 2, "strikes": 15}} = nearest 2 expiries, ATM +/-15 strikes, CE and PE.
+    kotak_auto_chain_json: str = field(default_factory=lambda: _s('KOTAK_AUTO_CHAIN_JSON', '{}'))
+    kotak_auto_chain_interval_sec: float = field(default_factory=lambda: _f('KOTAK_AUTO_CHAIN_INTERVAL_SEC', 30))
+    kotak_auto_chain_max_tokens: int = field(default_factory=lambda: _i('KOTAK_AUTO_CHAIN_MAX_TOKENS', 1000))
 
     # --- portfolio limits (INR unless noted) -------------------------------
     portfolio_soft_sl: float = field(default_factory=lambda: _f('PORTFOLIO_SOFT_SL', 2000))

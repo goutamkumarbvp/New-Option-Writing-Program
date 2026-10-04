@@ -341,38 +341,78 @@ class KotakStreamWorker(StreamWorker):
         super().__init__('KOTAK', handler, on_event)
         self.tokens = tokens
         self.session_provider = session_provider  # Kotak adapter: reuse its authenticated session
+        self.dynamic = set()   # (segment, token) pairs managed at runtime (option chain around spot)
+        self.ws = None         # live websocket while connected
+        self._sub_lock = asyncio.Lock()
+
+    def _static_scrips(self):
+        return set(parse_kotak_subscriptions(self.tokens)[0])
+
+    async def set_dynamic(self, pairs):
+        """Replace the runtime-managed scrip set. While connected, only the difference is
+        sent; a failed (un)subscribe leaves that part pending for the next call. While
+        disconnected the set is stored and subscribed in full on the next connect."""
+        from neo_api_client.websocket.feed import WsToken
+        pairs, static = set(pairs), self._static_scrips()
+        async with self._sub_lock:
+            add = sorted(pairs - self.dynamic - static)
+            remove = sorted(self.dynamic - pairs - static)
+            ws = self.ws
+            if ws is None:
+                self.dynamic = pairs
+            else:
+                if remove:
+                    await ws.unsubscribe_scrips([WsToken(seg, tok) for seg, tok in remove])
+                    self.dynamic -= set(remove)
+                if add:
+                    await ws.subscribe_scrips([WsToken(seg, tok) for seg, tok in add])
+                    self.dynamic |= set(add)
+                self.dynamic &= pairs | static
+        return {'added': len(add), 'removed': len(remove), 'total': len(self.dynamic), 'connected': ws is not None}
 
     async def run_once(self):
         from neo_api_client.websocket.feed import SFeedIndex, SFeedScrip, WsToken
         scrips, indices = parse_kotak_subscriptions(self.tokens)
+        if not scrips and not indices and not self.dynamic:
+            await asyncio.sleep(1)  # nothing to stream yet (auto chain waits for the instrument master)
+            return
         names = {(seg, _norm(tok)): tok for seg, tok in indices}  # packet name -> subscribed name
         underlyings = kotak_index_underlyings()
         c = await self.session_provider()
         async with c.create_websocket() as ws:
-            if scrips:
-                await ws.subscribe_scrips([WsToken(seg, tok) for seg, tok in scrips])
-            if indices:
-                await ws.subscribe_index([WsToken(seg, tok) for seg, tok in indices])
-            it = ws.__aiter__()
-            while not self.stop:
-                try:
-                    m = await asyncio.wait_for(it.__anext__(), settings.stream_stall_sec)
-                except asyncio.TimeoutError:
-                    if in_session(self.commodity):
-                        raise StreamError('STREAM_STALLED')
-                    continue
-                if isinstance(m, SFeedIndex):
-                    self.healthy = True
-                    sub = names.get((str(m.exchange_segment).lower(), _norm(m.name))) or \
-                        names.get((str(m.exchange_segment).lower(), _norm(m.trading_symbol)))
-                    await self.handler(kotak_index_tick(m, sub, underlyings))
-                elif isinstance(m, SFeedScrip):
-                    self.healthy = True
-                    bid = m.buy[0].price if m.buy else 0.0
-                    ask = m.sell[0].price if m.sell else 0.0
-                    await self.handler(Tick(broker='KOTAK', exchange=m.exchange_segment, instrument_token=str(m.instrument_token),
-                                            symbol=m.trading_symbol or str(m.instrument_token), ltp=float(m.last_traded_price),
-                                            bid=float(bid), ask=float(ask), volume=int(m.volume_traded_today or 0),
-                                            oi=int(m.open_interest or 0),
-                                            exchange_ts_ms=_ms(m.last_update_time) or _ms(m.last_trade_time),
-                                            receive_ts_ms=_now()))
+            async with self._sub_lock:
+                wanted = sorted(set(scrips) | self.dynamic)
+                if wanted:
+                    await ws.subscribe_scrips([WsToken(seg, tok) for seg, tok in wanted])
+                if indices:
+                    await ws.subscribe_index([WsToken(seg, tok) for seg, tok in indices])
+                self.ws = ws
+            try:
+                await self._consume(ws, names, underlyings, SFeedIndex, SFeedScrip)
+            finally:
+                self.ws = None
+
+    async def _consume(self, ws, names, underlyings, SFeedIndex, SFeedScrip):
+        it = ws.__aiter__()
+        while not self.stop:
+            try:
+                m = await asyncio.wait_for(it.__anext__(), settings.stream_stall_sec)
+            except asyncio.TimeoutError:
+                if in_session(self.commodity):
+                    raise StreamError('STREAM_STALLED')
+                continue
+            if isinstance(m, SFeedIndex):
+                self.healthy = True
+                sub = names.get((str(m.exchange_segment).lower(), _norm(m.name))) or \
+                    names.get((str(m.exchange_segment).lower(), _norm(m.trading_symbol)))
+                await self.handler(kotak_index_tick(m, sub, underlyings))
+            elif isinstance(m, SFeedScrip):
+                self.healthy = True
+                bid = m.buy[0].price if m.buy else 0.0
+                ask = m.sell[0].price if m.sell else 0.0
+                await self.handler(Tick(broker='KOTAK', exchange=m.exchange_segment, instrument_token=str(m.instrument_token),
+                                        symbol=m.trading_symbol or str(m.instrument_token), ltp=float(m.last_traded_price),
+                                        bid=float(bid), ask=float(ask), volume=int(m.volume_traded_today or 0),
+                                        oi=int(m.open_interest or 0),
+                                        exchange_ts_ms=_ms(m.last_update_time) or _ms(m.last_trade_time),
+                                        receive_ts_ms=_now()))
