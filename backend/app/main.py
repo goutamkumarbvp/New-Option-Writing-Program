@@ -28,7 +28,7 @@ from .market import MarketDataGateway
 from .models import OrderRequest, Tick
 from .oms import OrderService
 from .operator_auth import require_control_operator, require_live_operator
-from .option_chain import OptionChain
+from .option_chain import OptionChain, resolve_spot
 from .order_monitor import OrderMonitor
 from .readiness import ProductionReadiness
 from .reconcile import Reconciler
@@ -100,6 +100,12 @@ class Terminal:
             self.chain.update(t)
             await self.emit({'type': 'MARKET_TICK', 'tick': t.model_dump()})
         return r
+
+    def chain_ladder(self, exchange, underlying, expiry, depth=None):
+        """Read-only strike ladder for the terminal's Option Chain tab."""
+        rows = self.chain.snapshot(exchange, underlying, expiry)
+        spot = resolve_spot(self.feed, underlying, expiry, rows)
+        return self.chain.ladder(exchange, underlying, expiry, spot, lookup=self.instruments.get, depth=depth)
 
     # ---------------------------------------------------------- lifecycle
     async def _drain_bus(self):
@@ -219,9 +225,20 @@ def create_app(t: Terminal, run_background=True):
             return JSONResponse({'status': 'BLOCKED', 'reason': 'EXTERNAL_TICK_INGEST_DISABLED_IN_LIVE'}, status_code=403)
         return await t.handle_tick(tk)
 
+    @app.get('/option-chain')
+    def option_chain_index():
+        # Order policy is included so the terminal's ticket can show what the order path will refuse.
+        return {'chains': t.chain.index(), 'live_trading': settings.live_trading,
+                'market_orders_allowed': settings.allow_market_orders,
+                'naked_short_options_blocked': not settings.allow_naked_short_options}
+
     @app.get('/option-chain/{exchange}/{underlying}/{expiry}')
     def option_chain(exchange: str, underlying: str, expiry: str):
         return {'summary': t.chain.summary(exchange, underlying, expiry), 'rows': t.chain.snapshot(exchange, underlying, expiry)}
+
+    @app.get('/option-chain/{exchange}/{underlying}/{expiry}/ladder')
+    def option_chain_ladder(exchange: str, underlying: str, expiry: str, depth: Optional[int] = None):
+        return t.chain_ladder(exchange, underlying, expiry, max(1, min(depth, 100)) if depth else None)
 
     @app.post('/decision')
     def decision(o: OrderRequest):

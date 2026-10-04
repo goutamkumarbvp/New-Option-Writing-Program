@@ -42,6 +42,15 @@ NSE / BSE / MCX
 - Dashboard explicitly reports DATA UNAVAILABLE / durable-bus state.
 - Live credentials never belong in the ZIP.
 
+## Option Chain tab
+The web terminal's **Option Chain** tab shows a strike ladder per underlying and expiry: calls left, strikes centre, puts right, with OI bars, OI change, volume, IV, Greeks, PCR, max pain, ATM straddle, ATM highlight, ITM shading and a spot marker.
+
+- Data comes only from live, instrument-master-enriched broker ticks. With no ticks it shows DATA UNAVAILABLE.
+- Spot comes from `UNDERLYING_SPOT_TOKENS_JSON` (`{"NIFTY": {"ANGEL": "26000"}}`). Without it, spot is a put-call parity estimate and is labelled as such. With neither, ATM, model IV and Greeks are left blank.
+- IV and Greeks are Black-Scholes values from the quote mid. OI change counts from the first tick the terminal saw today.
+- Clicking a **Bid** opens a SELL (write) ticket and an **Ask** opens a BUY ticket. Tickets submit to `POST /orders` with the row's explicit broker and a client order ID, so every pre-trade control, the kill switch and operator auth still apply. Paper mode refuses them with `LIVE_TRADING_DISABLED`.
+- API: `GET /option-chain` lists chains and order policy; `GET /option-chain/{exchange}/{underlying}/{expiry}/ladder?depth=N` returns the ladder.
+
 ## Credentialed test
 Keep `LIVE_TRADING=false` and run:
 `python scripts/credentialed_live_certification.py`
