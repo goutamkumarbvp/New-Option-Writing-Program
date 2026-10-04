@@ -55,6 +55,11 @@ The web terminal's **Option Chain** tab shows a strike ladder per underlying and
 - **Login backoff.** A failed Kotak login waits 30, 60, 120 … seconds (capped at 15 minutes) before the next attempt, however many components ask for a session. Network, proxy, timeout and server errors only back off.
 - **Lockout protection.** When Kotak itself rejects the credentials twice in a row, automatic login halts and the dashboard shows `LOGIN_HALTED`. Fix the credentials, then press **Reset KOTAK login** on the Overview tab or call `POST /brokers/KOTAK/login-reset` with the operator token. Tune with `KOTAK_LOGIN_BACKOFF_SEC`, `KOTAK_LOGIN_BACKOFF_MAX_SEC` and `KOTAK_LOGIN_MAX_REJECTIONS`.
 - **Expiry decoding.** `pExpiryDate` follows the official SDK rule: NSE F&O adds 315511200 seconds, BSE F&O and MCX are plain Unix seconds. A decoded date must be plausible and must match the trading symbol's month or weekly date; otherwise expiry stays empty and option gates fail closed. This lets Kotak option ticks populate the Option Chain tab.
+- **Automatic instrument master.** Kotak publishes a new scrip master every day under a dated path. With `KOTAK_API_KEY` set, the terminal asks Kotak for the day's file paths, loads the `KOTAK_SCRIP_SEGMENTS` files together and checks again every `INSTRUMENT_REFRESH_CHECK_SEC`. This needs only the consumer key, not a login.
+  - Freshness follows the files' own date. Yesterday's files load only when nothing is loaded yet, and never count as today's, so orders stay blocked with `INSTRUMENT_MASTER_STALE` until today's files are in.
+  - A load is all or nothing. A failed fetch keeps the current index and retries after 60 s, 120 s … up to an hour.
+  - Parsing runs in a worker thread, so a 100k-row file does not stall live ticks.
+  - `POST /instruments/refresh/KOTAK` with the operator token loads now. Status is in the System tab under `instrument_loader`. Set `KOTAK_INSTRUMENT_MASTER_AUTO=false` to turn it off.
 - The SDK writes `logs/neo-api-client.log` in the working directory, including mobile number and client code. `logs/` is gitignored.
 
 ## Credentialed test

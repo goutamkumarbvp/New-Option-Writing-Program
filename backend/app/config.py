@@ -59,6 +59,11 @@ class Settings:
     subscription_json: str = field(default_factory=lambda: _s('SUBSCRIPTION_JSON', '{}'))
     instrument_master_urls_json: str = field(default_factory=lambda: _s('INSTRUMENT_MASTER_URLS_JSON', '{}'))
     underlying_spot_tokens_json: str = field(default_factory=lambda: _s('UNDERLYING_SPOT_TOKENS_JSON', '{}'))
+    # Kotak publishes a new scrip master every day under a dated path; the terminal finds
+    # and loads it automatically (consumer key only, no login) and refreshes it daily.
+    kotak_instrument_master_auto: bool = field(default_factory=lambda: _b('KOTAK_INSTRUMENT_MASTER_AUTO', True))
+    kotak_scrip_segments: str = field(default_factory=lambda: _s('KOTAK_SCRIP_SEGMENTS', 'nse_cm,nse_fo,bse_fo,mcx_fo'))
+    instrument_refresh_check_sec: float = field(default_factory=lambda: _f('INSTRUMENT_REFRESH_CHECK_SEC', 300))
 
     # --- portfolio limits (INR unless noted) -------------------------------
     portfolio_soft_sl: float = field(default_factory=lambda: _f('PORTFOLIO_SOFT_SL', 2000))

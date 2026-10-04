@@ -9,6 +9,7 @@ Normalised record: token, symbol, exchange, underlying, expiry (ISO date or None
 strike (rupees or None), option_type ('CE'/'PE'/None), lot_size, tick_size (rupees
 or None when the unit is not verified), instrument_type.
 """
+import asyncio
 import csv
 import gzip
 import io
@@ -161,46 +162,88 @@ def normalize_row(broker, r, today=None):
     raise ValueError(f'UNKNOWN_BROKER:{broker}')
 
 
+def _rows_from_text(text):
+    """JSON list or CSV rows. CSV rows are yielded one at a time so a large scrip master
+    is normalised row by row instead of holding every raw 60-column row in memory."""
+    stripped = text.lstrip()
+    if stripped[:1] in ('[', '{'):
+        rows = json.loads(text)
+        if not isinstance(rows, list):
+            raise ValueError('INSTRUMENT_MASTER_NOT_LIST')
+        return iter(rows)
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames:
+        reader.fieldnames = [str(f).strip() for f in reader.fieldnames]
+    return reader
+
+
 class InstrumentMaster:
     def __init__(self, data_dir=None):
         self.dir = Path(data_dir or settings.data_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.index = {}       # broker -> token -> record
-        self.loaded_at = {}   # broker -> epoch seconds
+        self.index = {}        # broker -> token -> record
+        self.loaded_at = {}    # broker -> epoch seconds
+        self.source_date = {}  # broker -> ISO date the broker published the files for, when known
+        self.transport = None  # httpx transport override (tests)
         for p in self.dir.glob('instruments_*.json'):
             try:
                 blob = json.loads(p.read_text())
-                self._install(blob['broker'], blob['rows'], blob.get('loaded_at', p.stat().st_mtime))
+                self._install(blob['broker'], blob['rows'], blob.get('loaded_at', p.stat().st_mtime), blob.get('source_date'))
             except Exception:  # noqa: BLE001 - a corrupt cache is ignored, not trusted
                 continue
 
-    def _install(self, broker, records, loaded_at):
+    def _install(self, broker, records, loaded_at, source_date=None):
         b = broker.upper()
         self.index[b] = {r['token']: r for r in records if r.get('token')}
         self.loaded_at[b] = loaded_at
+        if source_date:
+            self.source_date[b] = source_date
+        else:
+            self.source_date.pop(b, None)
 
-    def load_rows(self, broker, raw_rows):
+    def load_rows(self, broker, raw_rows, source_date=None):
         today = datetime.now(IST).date()
         records = [normalize_row(broker, r, today) for r in raw_rows if isinstance(r, dict)]
         now = time.time()
-        self._install(broker, records, now)
-        (self.dir / f'instruments_{broker.upper()}.json').write_text(
-            json.dumps({'broker': broker.upper(), 'loaded_at': now, 'rows': records}))
-        return {'broker': broker.upper(), 'count': len(self.index[broker.upper()]), 'loaded_at': now}
+        self._install(broker, records, now, source_date)
+        self._write_cache(broker.upper(), now, source_date, records)
+        return {'broker': broker.upper(), 'count': len(self.index[broker.upper()]), 'loaded_at': now, 'source_date': source_date}
+
+    def _write_cache(self, b, loaded_at, source_date, records, batch=2000):
+        """Encode in batches: one json.dumps of a 100k-row master holds the GIL for ~0.25 s,
+        which stalls the event loop even from a worker thread. Written to a temp file and
+        renamed, so a crash never leaves a half-written cache."""
+        path = self.dir / f'instruments_{b}.json'
+        tmp = path.with_name(path.name + '.tmp')
+        with tmp.open('w') as f:
+            f.write(json.dumps({'broker': b, 'loaded_at': loaded_at, 'source_date': source_date})[:-1] + ', "rows": [')
+            for i in range(0, len(records), batch):
+                f.write((',' if i else '') + json.dumps(records[i:i + batch])[1:-1])
+            f.write(']}')
+        tmp.replace(path)
+
+    async def _fetch_text(self, client, url):
+        r = await client.get(url)
+        r.raise_for_status()
+        raw = gzip.decompress(r.content) if r.content[:2] == b'\x1f\x8b' else r.content
+        return raw.decode('utf-8-sig')
+
+    async def load_urls(self, broker, urls, source_date=None):
+        """Download every file, then replace the broker's index with all of them together.
+        Any download failure raises before the index is touched (all or nothing). Parsing
+        and normalising run in a worker thread so the event loop keeps serving ticks."""
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True, transport=self.transport) as c:
+            texts = [await self._fetch_text(c, u) for u in urls]
+
+        def build():
+            return self.load_rows(broker, (row for text in texts for row in _rows_from_text(text)), source_date)
+        result = await asyncio.to_thread(build)
+        return {**result, 'files': len(texts)}
 
     async def load_url(self, url, broker):
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-            r = await c.get(url)
-            r.raise_for_status()
-            raw = gzip.decompress(r.content) if r.content[:2] == b'\x1f\x8b' else r.content
-        text = raw.decode('utf-8-sig')
-        try:
-            rows = json.loads(text)
-        except ValueError:
-            rows = list(csv.DictReader(io.StringIO(text)))
-        if not isinstance(rows, list):
-            raise ValueError('INSTRUMENT_MASTER_NOT_LIST')
-        return self.load_rows(broker, rows)
+        r = await self.load_urls(broker, [url])
+        r.pop('files', None)
+        return r
 
     def get(self, broker, token):
         return self.index.get(str(broker).upper(), {}).get(str(token))
@@ -209,12 +252,17 @@ class InstrumentMaster:
         return bool(self.index.get(str(broker).upper()))
 
     def fresh_today(self, broker):
-        ts = self.loaded_at.get(str(broker).upper())
+        """True when the index is today's. When the broker's files carry their own date
+        (Kotak), that date decides: yesterday's files loaded after midnight are not fresh."""
+        b = str(broker).upper()
+        if b in self.source_date:
+            return self.source_date[b] == trading_date()
+        ts = self.loaded_at.get(b)
         return bool(ts) and trading_date(datetime.fromtimestamp(ts, tz=timezone.utc)) == trading_date()
 
     def summary(self):
-        return {b: {'count': len(ix), 'loaded_at': self.loaded_at.get(b), 'fresh_today': self.fresh_today(b)}
-                for b, ix in self.index.items()}
+        return {b: {'count': len(ix), 'loaded_at': self.loaded_at.get(b), 'source_date': self.source_date.get(b),
+                    'fresh_today': self.fresh_today(b)} for b, ix in self.index.items()}
 
     # Backward-compatible search used by older tooling.
     @property

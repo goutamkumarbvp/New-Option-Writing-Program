@@ -22,6 +22,7 @@ from .dashboard import build_dashboard_state
 from .engine import DecisionPipeline
 from .eventbus import EventBus
 from .health_cache import HealthCache
+from .instrument_loader import KotakInstrumentLoader
 from .instruments import InstrumentMaster
 from .ledger import Ledger
 from .market import MarketDataGateway
@@ -61,6 +62,7 @@ class Terminal:
         self.order_monitor = OrderMonitor(self.brokers, self.ledger, self.emit)
         self.risk_monitor = RiskMonitor(self.brokers, self.feed, self.instruments, self.ledger, self.kill, self.emit)
         self.oms = OrderService(self)
+        self.instrument_loader = KotakInstrumentLoader(self.instruments, self.brokers, self.ledger, self.emit)
         self.risk_monitor.executor = self.oms
         self.readiness = ProductionReadiness(self.feed, self.health, self.watchdog, self.kill, self.instruments, None, self.ledger,
                                              self.bus, self.risk_monitor, self.order_monitor)
@@ -138,12 +140,14 @@ class Terminal:
         self.readiness.stream_manager = self.stream_manager
         await self.stream_manager.start()
         for name, coro in (('order-monitor', self.order_monitor.run()), ('risk-monitor', self.risk_monitor.run()),
-                           ('reconcile', self._reconcile_loop()), ('bus-drain', self._drain_bus())):
+                           ('reconcile', self._reconcile_loop()), ('bus-drain', self._drain_bus()),
+                           ('instrument-loader', self.instrument_loader.run())):
             self.tasks.append(asyncio.create_task(coro, name=name))
 
     async def stop(self):
         self.order_monitor.stop = True
         self.risk_monitor.stop = True
+        self.instrument_loader.stop = True
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -347,6 +351,18 @@ def create_app(t: Terminal, run_background=True):
         t.ledger.event('BROKER_LOGIN_RESET', {'broker': b.name, 'before': before})
         t.audit.append('BROKER_LOGIN_RESET', 'OPERATOR', {'broker': b.name, 'was_halted': before['halted']})
         return {'status': 'RESET', 'broker': b.name, 'before': before, 'login': after}
+
+    @app.post('/instruments/refresh/{broker}')
+    async def refresh_instruments(broker: str, x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Fetch and load today's Kotak scrip master now, ignoring the backoff and freshness checks."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        if str(broker).upper() != t.instrument_loader.broker_name:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'AUTO_REFRESH_ONLY_FOR_KOTAK'}, status_code=400)
+        if not t.instrument_loader.enabled():
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'KOTAK_AUTO_LOAD_DISABLED_OR_UNCONFIGURED'}, status_code=400)
+        r = await t.instrument_loader.run_once(force=True)
+        return JSONResponse(r, status_code=502 if r and r.get('status') == 'ERROR' else 200)
 
     @app.post('/instruments/load/{broker}')
     async def load_instruments(broker: str, url: str = Body(embed=True), x_iort_operator_token: Optional[str] = Header(default=None)):

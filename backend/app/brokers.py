@@ -443,6 +443,21 @@ class Kotak(BaseBroker):
             return {'broker': self.name, 'status': 'LOGIN_HALTED' if self._halted else 'AUTH_ERROR', 'error': str(exc)[:160],
                     'login': self.login_state()}
 
+    async def scrip_master_files(self):
+        """Today's scrip-master CSV URLs. Kotak's file-paths API needs only the consumer key,
+        so this never logs in and never touches the login backoff or lockout counters."""
+        if not settings.kotak_api_key:
+            raise RuntimeError('KOTAK_CONSUMER_KEY_MISSING')
+        factory = self._factory
+        if factory is None:
+            from neo_api_client import NeoAPI as factory
+        c = factory(consumer_key=settings.kotak_api_key, environment='prod')
+        resp = await asyncio.to_thread(c.scrip_master)
+        files = resp.get('filesPaths') if isinstance(resp, dict) else None
+        if not isinstance(files, list) or not files:
+            raise RuntimeError(f'KOTAK_SCRIP_MASTER_UNAVAILABLE:{str(resp)[:150]}')
+        return [str(f) for f in files if f]
+
     async def raw_orders(self):
         return await self._call('order_report')
 
