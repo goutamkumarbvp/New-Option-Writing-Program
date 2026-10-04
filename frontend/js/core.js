@@ -1,6 +1,6 @@
 "use strict";
 // Core: helpers, tabs, dashboard rendering, event stream and operator controls.
-const TABS=[['overview','Overview'],['market','Market'],['chain','Option Chain'],['risk','Risk'],['controls','Controls'],['execution','Execution'],['orders','Orders'],['recon','Reconciliation'],['tca','TCA'],['system','System']];
+const TABS=[['overview','Overview'],['market','Market'],['chain','Option Chain'],['portfolio','Portfolio'],['strategy','Strategy'],['risk','Risk'],['controls','Controls'],['execution','Execution'],['orders','Orders'],['recon','Reconciliation'],['tca','TCA'],['system','System']];
 let ws=null,reconnectTimer=null;const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=n=>n==null?'—':Number(n).toLocaleString('en-IN',{maximumFractionDigits:2});
@@ -10,7 +10,8 @@ function initTabs(){TABS.forEach(([id,label],i)=>{const b=document.createElement
  showTab(TABS.some(t=>t[0]===start)?start:TABS[0][0])}
 function showTab(id){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===id));document.querySelectorAll('.tabs button').forEach(x=>{x.classList.toggle('active',x.dataset.tab===id);x.setAttribute('aria-selected',x.dataset.tab===id)});
  try{localStorage.setItem('iort.tab',id)}catch{}if(location.hash!=='#'+id)history.replaceState(null,'','#'+id);
- CH.active=id==='chain';if(CH.active){CH.scroll=true;chLoadIndex().then(chLoadLadder)}}
+ CH.active=id==='chain';if(CH.active){CH.scroll=true;chLoadIndex().then(chLoadLadder)}
+ window.dispatchEvent(new CustomEvent('iort:tab',{detail:id}))}
 function logEvent(target,e){const el=$(target);if(!el)return;const row=document.createElement('div');row.className='event';row.textContent=new Date().toLocaleTimeString()+'  '+(e.type||'EVENT')+'  '+JSON.stringify(e.payload||e);el.prepend(row);while(el.children.length>100)el.removeChild(el.lastChild)}
 const yn=v=>v?'<span class="ok">YES</span>':'<span class="bad">NO</span>';
 const metric=(k,v,c='')=>`<div class="metric"><span>${esc(k)}</span><b class="${c}">${esc(v)}</b></div>`;

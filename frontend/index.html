@@ -63,6 +63,32 @@
 <div id="tkWarn"></div>
 <div class="control" style="margin-top:12px"><button id="tkSubmit" class="action red" type="button">Place order</button><button id="tkClear" class="action slate" type="button">Clear</button></div>
 <pre id="tkResult"></pre></div></div>
+<div class="card s4"><h3>Open interest by strike</h3><div id="chOiChart"></div></div>
+<div class="card s4"><h3>OI change since the first tick today</h3><div id="chOiChgChart"></div></div>
+<div class="card s4"><h3>IV smile</h3><div id="chIvChart"></div><p class="muted">Model IV from the quote mid; the vertical line is spot.</p></div>
+</div></section>
+
+<section id="portfolio" class="page" role="tabpanel"><div class="grid">
+<div class="card s12"><div class="control"><span id="pfStatus" class="pill warn">LOADING</span><span id="pfUpdated" class="muted"></span></div><div id="pfTiles" class="stats"></div></div>
+<div class="card s12"><h3>Positions</h3><div class="tw"><table><thead><tr><th>Broker</th><th>Symbol</th><th>Type</th><th>Expiry</th><th>Lots</th><th>Qty</th><th>LTP</th><th>P&amp;L</th><th>IV</th><th>Δ</th><th>Θ/day</th><th>Vega</th><th>Δ notional</th><th>Status</th></tr></thead><tbody id="pfRows"></tbody></table></div></div>
+<div class="card s12"><h3>By underlying</h3><div class="tw"><table><thead><tr><th>Underlying</th><th>Spot</th><th>Positions</th><th>Short / long option qty</th><th>P&amp;L</th><th>Δ notional</th><th>Γ P&amp;L (1% move)</th><th>Θ/day</th><th>Vega</th><th>Breakevens at expiry</th></tr></thead><tbody id="pfUnd"></tbody></table></div></div>
+<div class="card s7"><div class="control"><h3 style="margin:0">Payoff</h3><select id="pfUndSel" aria-label="Underlying for payoff"></select></div><div id="pfChart"></div><p class="muted">P&amp;L from today's marks: at the nearest expiry (later legs keep their time value) and today (T+0).</p></div>
+<div class="card s5"><h3>Scenario P&amp;L: spot shock × vol shock</h3><div id="pfHeat"></div><p class="muted">Full Black-Scholes revaluation of every leg. Fails closed when any leg cannot be priced.</p></div>
+</div></section>
+
+<section id="strategy" class="page" role="tabpanel"><div class="grid">
+<div class="card s12"><div class="control"><select id="stSym" aria-label="Underlying"></select><select id="stExp" aria-label="Expiry"></select><select id="stTpl" aria-label="Template"></select>
+<label class="muted">Lots <input id="stLots" class="narrow" type="number" min="1" max="100" value="1"></label>
+<label class="muted">Short Δ <input id="stDelta" class="narrow" type="number" min="0.02" max="0.5" step="0.01" value="0.20"></label>
+<label class="muted">Wing <input id="stWing" class="narrow" type="number" min="1" max="20" value="4"></label>
+<button id="stBuild" class="action blue" type="button">Build from live chain</button><span id="stStatus" class="muted"></span></div>
+<div id="stTiles" class="stats"></div></div>
+<div class="card s7"><h3>Payoff</h3><div id="stChart"></div><p class="muted">At expiry and today (T+0), from executable prices. Vertical lines mark spot and breakevens.</p></div>
+<div class="card s5"><h3>Legs</h3><div class="tw"><table><thead><tr><th>Side</th><th>Strike</th><th>Type</th><th>Lots</th><th>Price</th><th>IV</th><th>Δ</th><th></th></tr></thead><tbody id="stLegs"></tbody></table></div>
+<div class="control" style="margin-top:8px"><button id="stAddLeg" class="linkbtn" type="button">+ Add leg</button></div>
+<div id="stWarn"></div>
+<div class="control" style="margin-top:10px"><input id="stOp" type="password" autocomplete="off" placeholder="Operator token (live mode)"><button id="stExec" class="action red" type="button">Execute, hedges first</button></div>
+<pre id="stResult"></pre></div>
 </div></section>
 
 <section id="risk" class="page" role="tabpanel"><div class="grid">
@@ -121,7 +147,10 @@
 <p class="muted">Shortcuts never place orders. Every order and control action asks for confirmation.</p>
 <button class="action slate" type="button" data-action="close-overlay">Close</button></div></div>
 <script src="/static/js/core.js"></script>
+<script src="/static/js/charts.js"></script>
 <script src="/static/js/chain.js"></script>
 <script src="/static/js/shell.js"></script>
+<script src="/static/js/portfolio.js"></script>
+<script src="/static/js/strategy.js"></script>
 <script src="/static/js/main.js"></script>
 </body></html>

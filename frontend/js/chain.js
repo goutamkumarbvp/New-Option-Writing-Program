@@ -32,7 +32,16 @@ function chStats(d){const s=d.summary||{},sp=d.spot||{},src={SPOT_TOKEN:['LIVE S
   +tile('PCR (OI)',s.pcr!=null?s.pcr.toFixed(2):'—','Volume PCR '+(s.pcr_volume!=null?s.pcr_volume.toFixed(2):'—'))+tile('Max pain',s.max_pain!=null?fmt(s.max_pain):'—')
   +tile('ATM IV',s.atm_iv!=null?(s.atm_iv*100).toFixed(1)+'%':'—')+tile('ATM straddle',s.atm_straddle!=null?fmt(s.atm_straddle):'—',s.expected_move_pct!=null?'≈ ±'+s.expected_move_pct.toFixed(2)+'% expected move':'')
   +tile('Call OI / Put OI',compact(s.ce_oi)+' / '+compact(s.pe_oi),'chg '+esc(signed(s.ce_oi_change))+' / '+esc(signed(s.pe_oi_change)))}
-function chRenderEmpty(){const cols=chCols();chHead(cols);chStats({});chSetStatus('DATA UNAVAILABLE','bad');$('chUpdated').textContent='';
+// Analytics charts under the ladder: OI and OI change by strike (grouped columns), IV smile (lines).
+const CHV={};
+function chChart(id,Cls,o){if(!window.Charts)return;if(CHV[id])CHV[id].update(o);else CHV[id]=new Cls($(id),o)}
+function chCharts(d){const rows=(d&&d.strikes)||[],ks=rows.map(r=>r.strike),atm=rows.findIndex(r=>r.strike===d?.atm_strike);
+ const S1='var(--series-1)',S2='var(--series-2)',catFmt=k=>Number(k).toLocaleString('en-IN'),base={categories:ks,highlight:atm,catFmt,catName:'Strike',height:220};
+ chChart('chOiChart',Charts.BarChart,{...base,title:'Open interest by strike, calls and puts',series:[{name:'Calls',color:S1,values:rows.map(r=>r.CE?.oi??null)},{name:'Puts',color:S2,values:rows.map(r=>r.PE?.oi??null)}]});
+ chChart('chOiChgChart',Charts.BarChart,{...base,title:'Open interest change by strike',emptyText:'No OI change yet',series:[{name:'Calls',color:S1,values:rows.map(r=>r.CE?.oi_change??null)},{name:'Puts',color:S2,values:rows.map(r=>r.PE?.oi_change??null)}]});
+ chChart('chIvChart',Charts.LineChart,{x:ks,xFmt:catFmt,xName:'Strike',yFmt:v=>v.toFixed(1)+'%',height:220,title:'Implied volatility by strike',emptyText:'IV needs a spot price',
+  markers:d?.spot?.value?[{x:d.spot.value,label:'Spot'}]:[],series:[{name:'Call IV',color:S1,values:rows.map(r=>r.CE?.iv!=null?r.CE.iv*100:null)},{name:'Put IV',color:S2,values:rows.map(r=>r.PE?.iv!=null?r.PE.iv*100:null)}]})}
+function chRenderEmpty(){chCharts(null);const cols=chCols();chHead(cols);chStats({});chSetStatus('DATA UNAVAILABLE','bad');$('chUpdated').textContent='';
  $('chRows').innerHTML=`<tr><td class="empty" colspan="${cols.length*2+1}"><b>DATA UNAVAILABLE.</b> No live option ticks have reached the chain. Load each broker's instrument master (INSTRUMENT_MASTER_URLS_JSON) and subscribe the option tokens you want (SUBSCRIPTION_JSON). Subscribe the index (for Kotak, "nse_cm|Nifty 50") for an exact spot instead of the parity estimate.</td></tr>`}
 function chCell(leg,key,typ,strike,maxOI){if(!leg)return'<td></td>';
  const c=[];if(leg.itm)c.push('itm');if(leg.stale)c.push('stale');let v,st='',title=leg.stale?`Last update ${Math.round(leg.age_ms/1000)}s ago`:'';
@@ -50,7 +59,7 @@ function chRender(){const d=CH.data;if(!d||!(d.strikes||[]).length){chRenderEmpt
  let html='',spotDone=!S;for(const r of d.strikes){if(!spotDone&&r.strike>S){html+=spotRow();spotDone=true}
   html+=`<tr class="${r.strike===d.atm_strike?'atm':''}">`+cols.map(([k])=>chCell(r.CE,k,'CE',r.strike,maxOI)).join('')
    +`<td class="k">${esc(fmt(r.strike))}<span class="pcr">${r.pcr!=null?'PCR '+r.pcr.toFixed(2):''}</span></td>`+pc.map(([k])=>chCell(r.PE,k,'PE',r.strike,maxOI)).join('')+'</tr>'}
- if(!spotDone)html+=spotRow();$('chRows').innerHTML=html;chStats(d);
+ if(!spotDone)html+=spotRow();$('chRows').innerHTML=html;chStats(d);chCharts(d);
  chSetStatus(d.live?(d.stale_legs?`LIVE · ${d.stale_legs} STALE`:'LIVE'):'STALE',d.live?(d.stale_legs?'warn':'ok'):'warn');$('chUpdated').textContent='Updated '+new Date(d.generated_ms).toLocaleTimeString();
  // First render of a selection: centre the ATM row vertically and the strike column horizontally (narrow screens).
  if(CH.scroll&&d.atm_strike!=null){const row=$('chRows').querySelector('tr.atm');if(row){const w=$('chWrap'),k=row.querySelector('td.k');
