@@ -32,6 +32,7 @@ from .oms import OrderService
 from .operator_auth import require_control_operator, require_live_operator
 from .option_chain import OptionChain, resolve_spot
 from .order_monitor import OrderMonitor
+from .portfolio import build_portfolio
 from .readiness import ProductionReadiness
 from .reconcile import Reconciler
 from .risk_monitor import RiskMonitor
@@ -225,6 +226,11 @@ def create_app(t: Terminal, run_background=True):
     def risk_snapshot():
         return {'aggregate': t.risk_monitor.aggregate(), 'last_eval': t.risk_monitor.last_eval,
                 'snapshots': {b: s.to_dict() for b, s in t.risk_monitor.snapshots.items()}}
+
+    @app.get('/risk/portfolio')
+    def risk_portfolio():
+        """Position Greeks, per-underlying and firm aggregates, scenario grid and payoff curves (read-only)."""
+        return build_portfolio(t.risk_monitor.snapshots, t.feed, t.chain)
 
     @app.post('/market/tick')
     async def tick(tk: Tick):

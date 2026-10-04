@@ -306,6 +306,10 @@ class OrderService:
                 spots[und] = tk.ltp
         legs = [dict(p) for p in snap.positions if p['qty']]
         legs.append({**rec, 'token': o.instrument_token, 'symbol': o.symbol, 'qty': signed, 'price': est_px})
+        for und in {leg.get('underlying') for leg in legs if leg.get('option_type') in ('CE', 'PE')} - set(spots):
+            tk = self.t.feed.live_spot(und) if und else None  # a streamed index or cash tick of the underlying
+            if tk:
+                spots[und] = tk.ltp
         return revalue(legs, spots)
 
     # ------------------------------------------------------------------ send
