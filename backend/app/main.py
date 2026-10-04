@@ -32,6 +32,7 @@ from .oms import OrderService
 from .operator_auth import require_control_operator, require_live_operator
 from .option_chain import OptionChain, resolve_spot
 from .order_monitor import OrderMonitor
+from .options_strategy import TEMPLATES, StrategyError, analyze, template
 from .portfolio import build_portfolio
 from .readiness import ProductionReadiness
 from .reconcile import Reconciler
@@ -253,6 +254,29 @@ def create_app(t: Terminal, run_background=True):
     @app.get('/option-chain/{exchange}/{underlying}/{expiry}/ladder')
     def option_chain_ladder(exchange: str, underlying: str, expiry: str, depth: Optional[int] = None):
         return t.chain_ladder(exchange, underlying, expiry, max(1, min(depth, 100)) if depth else None)
+
+    @app.get('/strategy/templates')
+    def strategy_templates():
+        return {'templates': [{'name': k, 'description': v} for k, v in TEMPLATES.items()]}
+
+    @app.get('/strategy/template/{exchange}/{underlying}/{expiry}/{name}')
+    def strategy_template(exchange: str, underlying: str, expiry: str, name: str, lots: int = 1, delta: float = 0.20, wing: int = 4):
+        """Pick a named option-writing structure from the live chain and analyse it (read-only)."""
+        ladder = t.chain_ladder(exchange, underlying, expiry)
+        try:
+            specs = template(name, ladder, max(1, min(lots, 100)), max(0.02, min(delta, 0.5)), max(1, min(wing, 20)))
+            return {'template': name, **analyze(ladder, specs)}
+        except StrategyError as exc:
+            return JSONResponse({'status': 'UNAVAILABLE', 'reason': str(exc)}, status_code=422)
+
+    @app.post('/strategy/analyze')
+    def strategy_analyze(payload: dict = Body(...)):
+        """Analyse legs [{side, lots, strike, option_type | token, price?}] against the live chain (read-only)."""
+        ladder = t.chain_ladder(str(payload.get('exchange', '')), str(payload.get('underlying', '')), str(payload.get('expiry', '')))
+        try:
+            return analyze(ladder, list(payload.get('legs') or [])[:12])
+        except (StrategyError, TypeError, ValueError) as exc:
+            return JSONResponse({'status': 'UNAVAILABLE', 'reason': str(exc)}, status_code=422)
 
     @app.post('/decision')
     def decision(o: OrderRequest):
