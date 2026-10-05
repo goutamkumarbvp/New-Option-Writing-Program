@@ -1,0 +1,20 @@
+# Keep Unix line ends for files read inside the Linux containers or by Docker Compose, even when the
+# repository is checked out on Windows (git's core.autocrlf would otherwise turn them into CRLF).
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+# Windows PowerShell 5.1 reads either; CRLF is what Notepad and the ISE write.
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary

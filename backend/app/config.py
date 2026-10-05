@@ -5,28 +5,140 @@ Every live-trading switch defaults to the safe (disabled / fail-closed) value.
 """
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def parse_env_line(raw):
+    """(key, value) for one .env line, or None. Accepts what Docker Compose accepts: blank lines and
+    # comments, an optional 'export ', single or double quotes (kept verbatim inside, so JSON is
+    safe), an unquoted value ending at ' #' or a tab-#, and Windows CRLF line ends."""
+    line = raw.strip().lstrip('\ufeff')
+    if not line or line.startswith('#') or '=' not in line:
+        return None
+    k, v = line.split('=', 1)
+    k = k.strip()
+    if k.startswith('export '):
+        k = k[7:].strip()
+    v = v.strip()
+    if v[:1] in ('"', "'"):
+        end = v.find(v[0], 1)
+        v = v[1:end] if end > 0 else v[1:]
+    elif v.startswith('#'):
+        v = ''  # 'KEY=   # note' is an empty value followed by a comment
+    else:
+        for marker in (' #', '\t#'):
+            v = v.split(marker, 1)[0]
+        v = v.strip()
+    return (k, v) if k else None
+
+
+def _read_env_text(f):
+    """Text of a .env file in UTF-8 (with or without BOM) or UTF-16 (what Notepad's 'Unicode' and Windows
+    PowerShell 5.1 redirection write). Returns (text, problem)."""
+    data = f.read_bytes()
+    if data[:2] in (b'\xff\xfe', b'\xfe\xff') or b'\x00' in data[:200]:
+        try:
+            return data.decode('utf-16'), 'ENV_FILE_UTF16:save .env as UTF-8 (it was read anyway)'
+        except UnicodeDecodeError:
+            return '', 'ENV_FILE_UNREADABLE:save .env as UTF-8'
+    return data.decode('utf-8-sig', errors='replace'), None
+
+
+def load_dotenv(path=None):
+    """Fill settings that the process environment does not set from the project's .env file.
+
+    Docker Compose already hands .env to the container; this makes a run without Docker
+    (python -m app, the Windows kit's native mode) read the same file. The process environment
+    always wins. IORT_ENV_FILE points at another file; IORT_NO_DOTENV=1 turns loading off (tests).
+    Returns the file that was read, or None. A file it cannot fully read never stops the terminal."""
+    global DOTENV_PROBLEM
+    if os.getenv('IORT_NO_DOTENV', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
+        return None
+    here = Path(__file__).resolve()
+    candidates = [Path(os.environ['IORT_ENV_FILE'])] if os.getenv('IORT_ENV_FILE') else [here.parents[2] / '.env']
+    if path is not None:
+        candidates = [Path(path)]
+    for f in candidates:
+        try:
+            text, problem = _read_env_text(f)
+        except OSError:
+            continue
+        DOTENV_PROBLEM = problem
+        for raw in text.splitlines():
+            kv = parse_env_line(raw.replace('\x00', ''))
+            if kv:
+                try:
+                    os.environ.setdefault(*kv)
+                except ValueError:  # a stray NUL or similar: skip the line, never crash
+                    DOTENV_PROBLEM = DOTENV_PROBLEM or f'ENV_FILE_BAD_LINE:{kv[0]}'
+        return str(f)
+    return None
+
+
+DOTENV_PROBLEM = None
+DOTENV_FILE = load_dotenv()
+
+
+# Settings that could not be parsed. They fall back to the default, are reported by name (never by
+# value) and block live order routing through validation_errors(), so a typo can never loosen a limit
+# or crash the terminal before it can say what is wrong.
+CONFIG_ERRORS = []
+_TRUE, _FALSE = {'1', 'true', 'yes', 'on'}, {'0', 'false', 'no', 'off'}
+
+
+def _raw(name):
+    v = os.getenv(name)
+    return None if v is None or v.strip() == '' else v.strip()
 
 
 def _b(name, default=False):
-    return os.getenv(name, str(default)).strip().lower() in {'1', 'true', 'yes', 'on'}
+    v = _raw(name)
+    if v is None:
+        return default
+    if v.lower() in _TRUE or v.lower() in _FALSE:
+        return v.lower() in _TRUE
+    CONFIG_ERRORS.append(name)
+    return default
 
 
 def _i(name, default):
-    return int(os.getenv(name, str(default)))
+    v = _raw(name)
+    if v is None:
+        return default
+    try:
+        return int(float(v))
+    except ValueError:
+        CONFIG_ERRORS.append(name)
+        return default
 
 
 def _f(name, default):
-    return float(os.getenv(name, str(default)))
+    v = _raw(name)
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        CONFIG_ERRORS.append(name)
+        return default
 
 
 def _s(name, default=''):
     return os.getenv(name, default)
 
 
+def _js(name, default='{}'):
+    """A JSON setting. Outer quotes copied from a .env file into a Windows or cloud environment
+    variable are removed, so '{"NIFTY":...}' works the same in both places."""
+    v = os.getenv(name, default).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1].strip()
+    return v or default
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- mode and authority -------------------------------------------------
-    app_env: str = field(default_factory=lambda: _s('APP_ENV', 'production'))
     live_trading: bool = field(default_factory=lambda: _b('LIVE_TRADING', False))
     auto_trading_enabled: bool = field(default_factory=lambda: _b('AUTO_TRADING_ENABLED', False))
     require_human_approval_auto: bool = field(default_factory=lambda: _b('REQUIRE_HUMAN_APPROVAL_AUTO', True))
@@ -56,9 +168,16 @@ class Settings:
     data_stale_ms: int = field(default_factory=lambda: _i('DATA_STALE_MS', 1500))
     max_clock_skew_ms: int = field(default_factory=lambda: _i('MAX_CLOCK_SKEW_MS', 2000))
     stream_stall_sec: int = field(default_factory=lambda: _i('STREAM_STALL_SEC', 30))
-    subscription_json: str = field(default_factory=lambda: _s('SUBSCRIPTION_JSON', '{}'))
-    instrument_master_urls_json: str = field(default_factory=lambda: _s('INSTRUMENT_MASTER_URLS_JSON', '{}'))
-    underlying_spot_tokens_json: str = field(default_factory=lambda: _s('UNDERLYING_SPOT_TOKENS_JSON', '{}'))
+    # Feed reconnect: a drop after a healthy connection retries at once, then 1, 2, 5, 10, 20 s up to the cap.
+    # A connection counts as healthy once it delivered data or stayed up STREAM_HEALTHY_RESET_SEC.
+    stream_auto_reconnect: bool = field(default_factory=lambda: _b('STREAM_AUTO_RECONNECT', True))
+    stream_reconnect_max_sec: float = field(default_factory=lambda: _f('STREAM_RECONNECT_MAX_SEC', 30))
+    stream_healthy_reset_sec: float = field(default_factory=lambda: _f('STREAM_HEALTHY_RESET_SEC', 30))
+    stream_relogin_after_failures: int = field(default_factory=lambda: _i('STREAM_RELOGIN_AFTER_FAILURES', 3))
+    kotak_stream_stall_sec: float = field(default_factory=lambda: _f('KOTAK_STREAM_STALL_SEC', 15))
+    subscription_json: str = field(default_factory=lambda: _js('SUBSCRIPTION_JSON'))
+    instrument_master_urls_json: str = field(default_factory=lambda: _js('INSTRUMENT_MASTER_URLS_JSON'))
+    underlying_spot_tokens_json: str = field(default_factory=lambda: _js('UNDERLYING_SPOT_TOKENS_JSON'))
     # Kotak publishes a new scrip master every day under a dated path; the terminal finds
     # and loads it automatically (consumer key only, no login) and refreshes it daily.
     kotak_instrument_master_auto: bool = field(default_factory=lambda: _b('KOTAK_INSTRUMENT_MASTER_AUTO', True))
@@ -69,10 +188,10 @@ class Settings:
     instrument_refresh_after_ist: str = field(default_factory=lambda: _s('INSTRUMENT_REFRESH_AFTER_IST', '08:30'))
     # Extra Kotak index-name -> F&O underlying mappings, e.g. {"Nifty IT": "NIFTYIT"} (built-ins cover
     # Nifty 50, Nifty Bank, Nifty Fin Service, Nifty Mid Select, Nifty Next 50, SENSEX, BANKEX).
-    kotak_index_underlyings_json: str = field(default_factory=lambda: _s('KOTAK_INDEX_UNDERLYINGS_JSON', '{}'))
+    kotak_index_underlyings_json: str = field(default_factory=lambda: _js('KOTAK_INDEX_UNDERLYINGS_JSON'))
     # Option strikes kept subscribed around spot, per underlying:
     # {"NIFTY": {"expiries": 2, "strikes": 15}} = nearest 2 expiries, ATM +/-15 strikes, CE and PE.
-    kotak_auto_chain_json: str = field(default_factory=lambda: _s('KOTAK_AUTO_CHAIN_JSON', '{}'))
+    kotak_auto_chain_json: str = field(default_factory=lambda: _js('KOTAK_AUTO_CHAIN_JSON'))
     kotak_auto_chain_interval_sec: float = field(default_factory=lambda: _f('KOTAK_AUTO_CHAIN_INTERVAL_SEC', 30))
     kotak_auto_chain_max_tokens: int = field(default_factory=lambda: _i('KOTAK_AUTO_CHAIN_MAX_TOKENS', 1000))
 
@@ -128,13 +247,32 @@ class Settings:
     kotak_totp: str = field(default_factory=lambda: _s('KOTAK_TOTP'))
     kotak_totp_secret: str = field(default_factory=lambda: _s('KOTAK_TOTP_SECRET'))
     kotak_mpin: str = field(default_factory=lambda: _s('KOTAK_MPIN'))
-    kotak_session_ttl_sec: int = field(default_factory=lambda: _i('KOTAK_SESSION_TTL_SEC', 6 * 3600))
+    # A session lasts the IST trading day (it is replaced at day rollover or when Kotak ends it). The TTL is
+    # only a backstop: a short one forced a midday re-login that also dropped the live feed.
+    kotak_session_ttl_sec: int = field(default_factory=lambda: _i('KOTAK_SESSION_TTL_SEC', 20 * 3600))
     # Login backoff: failed logins wait base * 2^(n-1) seconds (capped) before the next attempt.
     # Credential rejections (wrong MPIN/TOTP) halt automatic login after this many in a row,
     # so the terminal cannot lock the account; an operator reset or a restart clears the halt.
     kotak_login_backoff_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_BACKOFF_SEC', 30))
     kotak_login_backoff_max_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_BACKOFF_MAX_SEC', 900))
     kotak_login_max_rejections: int = field(default_factory=lambda: _i('KOTAK_LOGIN_MAX_REJECTIONS', 2))
+    # Network, gateway and maintenance failures never reach the credential check: they retry sooner
+    # (5, 10, 20, 40 s, capped at 60 s) and never count toward the halt.
+    kotak_login_transport_backoff_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_TRANSPORT_BACKOFF_SEC', 5))
+    kotak_login_transport_backoff_max_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_TRANSPORT_BACKOFF_MAX_SEC', 60))
+    kotak_login_step_timeout_sec: float = field(default_factory=lambda: _f('KOTAK_LOGIN_STEP_TIMEOUT_SEC', 20))
+    # Session expiries that may trigger an automatic re-login within 15 minutes (prevents login storms).
+    kotak_relogin_budget: int = field(default_factory=lambda: _i('KOTAK_RELOGIN_BUDGET', 4))
+    # Session upkeep: a session from an earlier IST day is replaced, and on weekdays after this IST time
+    # the terminal logs in by itself so the open starts with a fresh one ('' turns this off). After this
+    # many failed calls in a row with no success, the session is treated as silently expired.
+    kotak_prelogin_ist: str = field(default_factory=lambda: _s('KOTAK_PRELOGIN_IST', '08:50'))
+    kotak_relogin_after_errors: int = field(default_factory=lambda: _i('KOTAK_RELOGIN_AFTER_ERRORS', 3))
+    # Kotak accepts API orders only from the static public IP registered with it. With live order routing,
+    # orders stay blocked unless this machine's public IP (looked up at PUBLIC_IP_URL) matches.
+    registered_static_ip: str = field(default_factory=lambda: _s('REGISTERED_STATIC_IP'))
+    require_static_ip_match: bool = field(default_factory=lambda: _b('REQUIRE_STATIC_IP_MATCH', True))
+    public_ip_url: str = field(default_factory=lambda: _s('PUBLIC_IP_URL', 'https://api.ipify.org'))
 
     def validation_errors(self):
         """Configuration errors that must stop live trading."""
@@ -148,6 +286,9 @@ class Settings:
             errors.append('AI_GATE_MODE_INVALID')
         if self.live_trading and self.require_operator_auth and len(self.operator_api_token) < self.operator_token_min_length:
             errors.append('OPERATOR_API_TOKEN_TOO_SHORT')
+        errors += [f'CONFIG_INVALID:{name}' for name in dict.fromkeys(CONFIG_ERRORS)]
+        if DOTENV_PROBLEM:
+            errors.append(DOTENV_PROBLEM)
         return errors
 
 

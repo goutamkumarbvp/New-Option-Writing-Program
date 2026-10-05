@@ -13,7 +13,7 @@ from app.instruments import KOTAK_FO_EPOCH_OFFSET, kotak_expiry, normalize_row, 
 from app.main import create_app
 from app.models import Tick
 
-CREDS = dict(kotak_api_key='key', kotak_mobile='+910000000000', kotak_client_code='UCC', kotak_mpin='000000',
+CREDS = dict(kotak_api_key='key', kotak_mobile='+919876543210', kotak_client_code='UCC', kotak_mpin='000000',
              kotak_totp='123456', kotak_totp_secret='')
 
 
@@ -62,7 +62,7 @@ def login(k, force=False):
 # ------------------------------------------------------------------ login backoff
 def test_transport_failures_back_off_exponentially_with_cap(settings_override):
     k, calls, now = kotak([ApiErr(0), ApiErr(0), ApiErr(503), ApiErr(0)], settings_override,
-                          kotak_login_backoff_sec=30, kotak_login_backoff_max_sec=100)
+                          kotak_login_transport_backoff_sec=30, kotak_login_transport_backoff_max_sec=100)
     with pytest.raises(RuntimeError, match='KOTAK_LOGIN_TRANSPORT:retry_in=30s'):
         login(k)
     with pytest.raises(RuntimeError, match='KOTAK_LOGIN_BACKOFF'):
@@ -83,8 +83,10 @@ def test_transport_failures_back_off_exponentially_with_cap(settings_override):
     assert len(calls) == 4 and not k.login_state()['halted'] and k.login_state()['consecutive_rejections'] == 0
     now[0] += 100
     assert login(k) is not None
-    assert k.login_state() == {'halted': False, 'consecutive_failures': 0, 'consecutive_rejections': 0,
-                               'retry_in_sec': 0, 'last_error': None}
+    st = k.login_state()
+    assert {key: st[key] for key in ('halted', 'consecutive_failures', 'consecutive_rejections', 'retry_in_sec', 'last_error')} == {
+        'halted': False, 'consecutive_failures': 0, 'consecutive_rejections': 0, 'retry_in_sec': 0, 'last_error': None}
+    assert st['logged_in'] and not st['session_expired'] and st['session_age_sec'] == 0
 
 
 def test_credential_rejections_halt_until_operator_reset(settings_override):
@@ -104,14 +106,15 @@ def test_credential_rejections_halt_until_operator_reset(settings_override):
     assert login(k) is not None and len(calls) == 3
 
 
-def test_transport_failure_breaks_a_rejection_streak(settings_override):
+def test_network_error_does_not_reset_the_rejection_count(settings_override):
+    # Kotak's own lockout counter is not reset by a network error in between, so ours is not either.
     k, calls, now = kotak([ApiErr(401), ApiErr(0), ApiErr(403)], settings_override, kotak_login_max_rejections=2,
-                          kotak_login_backoff_max_sec=1)
+                          kotak_login_backoff_max_sec=1, kotak_login_transport_backoff_max_sec=1)
     for _ in range(3):
         with pytest.raises(RuntimeError):
             login(k)
         now[0] += 1
-    assert not k.login_state()['halted'] and k.login_state()['consecutive_rejections'] == 1
+    assert k.login_state()['halted'] and k.login_state()['consecutive_rejections'] == 2
 
 
 def test_concurrent_callers_share_one_login_attempt(settings_override):

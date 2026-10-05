@@ -129,7 +129,9 @@ class OrderService:
                 raise Blocked('INSTRUMENT_SYMBOL_MISMATCH', master_symbol=rec['symbol'])
             if rec.get('exchange') and rec['exchange'] != o.exchange:
                 raise Blocked('INSTRUMENT_EXCHANGE_MISMATCH', master_exchange=rec['exchange'])
-            lot = int(rec.get('lot_size') or 1)
+            if not rec.get('lot_size'):
+                raise Blocked('LOT_SIZE_UNKNOWN')
+            lot = int(rec['lot_size'])
             if o.qty % lot:
                 raise Blocked('LOT_SIZE_VIOLATION', lot_size=lot)
             if expired(rec.get('expiry')):

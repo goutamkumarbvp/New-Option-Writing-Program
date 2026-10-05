@@ -7,10 +7,11 @@
 <div class="topbar">
 <header><div class="brand"><span class="logo">IORT</span><span id="ver" class="muted"></span><span class="brand-sub">Options Risk Terminal</span></div>
 <div class="statusbar"><span id="conn" class="pill warn">CONNECTING</span><span id="marketPill" class="pill bad">DATA UNAVAILABLE</span>
-<span id="latPill" class="pill" title="Median exchange-to-terminal latency of live feeds">FEED —</span>
+<span id="streamPill" class="pill" title="Broker market-data feed state">FEED —</span>
+<span id="latPill" class="pill" title="Median exchange-to-terminal latency of live feeds">LATENCY —</span>
 <span id="nsePill" class="pill" title="NSE/BSE equity derivatives session (exchange holidays not modelled)">NSE —</span>
 <span id="mcxPill" class="pill" title="MCX session (exchange holidays not modelled)">MCX —</span>
-<span id="modePill" class="pill">PAPER</span><span id="killPill" class="pill">KILL: OFF</span>
+<span id="modePill" class="pill" title="Order routing interlock (LIVE_TRADING). LOCKED: every order is refused before any broker.">ORDERS —</span><span id="killPill" class="pill">KILL: —</span>
 <button id="paletteBtn" class="pill kbd" type="button" title="Command palette (Ctrl+K)" aria-haspopup="dialog">Ctrl K</button>
 <span id="clock" class="muted mono" title="India Standard Time"></span></div></header>
 <nav class="tabs" id="tabs" role="tablist" aria-label="Terminal sections"></nav>
@@ -19,7 +20,7 @@
 
 <section id="overview" class="page" role="tabpanel"><div class="grid">
 <div class="card s3"><div class="muted">MARKET</div><div id="ovMarket" class="value bad">DATA UNAVAILABLE</div></div>
-<div class="card s3"><div class="muted">EXECUTION</div><div id="ovExec" class="value bad">DISABLED</div></div>
+<div class="card s3"><div class="muted">ORDER ROUTING</div><div id="ovExec" class="value">—</div></div>
 <div class="card s3"><div class="muted">FIRM P&amp;L (TOTAL / DAY)</div><div id="ovPnl" class="value">—</div></div>
 <div class="card s3"><div class="muted">READINESS</div><div id="ovReadyFlag" class="value">—</div></div>
 <div class="card s6"><h3>Broker health</h3><div id="ovBrokers"></div></div>
@@ -31,7 +32,7 @@
 <section id="market" class="page" role="tabpanel"><div class="grid">
 <div class="card s8"><h3>Live market feed</h3><div class="tw"><table><thead><tr><th>Broker</th><th>Token</th><th>Exchange</th><th>Symbol</th><th>LTP</th><th>Bid</th><th>Ask</th><th>OI</th><th>Exchange time</th></tr></thead><tbody id="marketRows"></tbody></table></div></div>
 <div class="card s4"><h3>Feed quality</h3><div id="marketQuality"></div></div>
-<div class="card s12"><h3>Stream workers</h3><div class="tw"><table><thead><tr><th>Broker</th><th>Running</th><th>Healthy</th><th>Reconnects</th><th>Dropped</th><th>Auto tokens</th><th>Last error</th></tr></thead><tbody id="workerRows"></tbody></table></div></div>
+<div class="card s12"><h3>Live feeds</h3><div class="tw"><table><thead><tr><th>Broker</th><th>State</th><th>Up / down</th><th>Last message</th><th>Recoveries</th><th>Drops</th><th>Back-pressure drops</th><th>Auto tokens</th><th>Last disconnect</th><th>Control</th></tr></thead><tbody id="workerRows"></tbody></table></div><p class="muted">A dropped feed reconnects at once, then after 1, 2, 5, 10 and 20 s, up to 30 s. <b>Reconnect now</b> skips any wait; <b>Auto</b> off leaves a dropped feed down until you reconnect it. Both need the operator token from the Execution tab.</p></div>
 <div class="card s8"><h3>Option chains</h3><div class="tw"><table><thead><tr><th>Exchange</th><th>Underlying</th><th>Expiry</th><th>Contracts</th><th></th></tr></thead><tbody id="chainRows"></tbody></table></div></div>
 <div class="card s4"><h3>Chain auto-subscription</h3><div id="autoChain"></div></div>
 </div></section>
@@ -47,7 +48,7 @@
 <div id="chWrap" class="chainwrap"><table class="chain"><thead id="chHead"></thead><tbody id="chRows"></tbody></table></div>
 <p class="muted">IV and Greeks are Black-Scholes values from the quote mid (MODEL), or the broker's IV when no spot is available (FEED). Spot comes from a live index or cash tick of the underlying (UNDERLYING_SPOT_TOKENS_JSON can name one), else a put-call parity estimate. OI chg counts from the first tick this terminal saw today. Shaded cells are in the money. Dimmed cells are stale.</p></div>
 <div class="card s3 ticket"><h3>Order ticket</h3>
-<div id="tkEmpty" class="muted">Click a <b>Bid</b> in the chain to write (sell) that option, or an <b>Ask</b> to buy it.<br><br>Orders go through every pre-trade control, the kill switch and operator auth. In paper mode they are blocked before reaching a broker.</div>
+<div id="tkEmpty" class="muted">Click a <b>Bid</b> in the chain to write (sell) that option, or an <b>Ask</b> to buy it.<br><br>Orders go through every pre-trade control, the kill switch and operator auth. While order routing is locked (LIVE_TRADING=false) they are refused before reaching a broker.</div>
 <div id="tkBody" hidden>
 <div id="tkSym" class="sym"></div><div id="tkMeta" class="muted"></div><div id="tkQuote" class="muted" style="margin-top:6px"></div>
 <div class="seg"><button id="tkSellBtn" class="sell" type="button">SELL / WRITE</button><button id="tkBuyBtn" class="buy" type="button">BUY</button></div>
@@ -58,7 +59,7 @@
 <label>Limit price<input id="tkPrice" type="number" min="0.05" step="0.05"></label>
 <label>Product<select id="tkProd"><option>NRML</option><option>MIS</option></select></label>
 <label>Client order ID<input id="tkCid" readonly></label>
-<label class="full">Operator token<input id="tkOp" type="password" autocomplete="off" placeholder="Required in live mode"></label></div>
+<label class="full">Operator token<input id="tkOp" type="password" autocomplete="off" placeholder="Required when order routing is live"></label></div>
 <div class="metric" style="margin-top:10px"><span id="tkPremLbl">Premium</span><b id="tkPrem">—</b></div>
 <div id="tkWarn"></div>
 <div class="control" style="margin-top:12px"><button id="tkSubmit" class="action red" type="button">Place order</button><button id="tkClear" class="action slate" type="button">Clear</button></div>
@@ -87,14 +88,14 @@
 <div class="card s5"><h3>Legs</h3><div class="tw"><table><thead><tr><th>Side</th><th>Strike</th><th>Type</th><th>Lots</th><th>Price</th><th>IV</th><th>Δ</th><th></th></tr></thead><tbody id="stLegs"></tbody></table></div>
 <div class="control" style="margin-top:8px"><button id="stAddLeg" class="linkbtn" type="button">+ Add leg</button></div>
 <div id="stWarn"></div>
-<div class="control" style="margin-top:10px"><input id="stOp" type="password" autocomplete="off" placeholder="Operator token (live mode)"><button id="stExec" class="action red" type="button">Execute, hedges first</button></div>
+<div class="control" style="margin-top:10px"><input id="stOp" type="password" autocomplete="off" placeholder="Operator token (required when order routing is live)"><button id="stExec" class="action red" type="button">Execute, hedges first</button></div>
 <pre id="stResult"></pre></div>
 </div></section>
 
 <section id="risk" class="page" role="tabpanel"><div class="grid">
 <div class="card s4"><h3>Limits</h3><div id="riskLimits"></div></div>
 <div class="card s8"><h3>Broker-authoritative book</h3><div id="riskSnaps"></div></div>
-<div class="card s4"><h3>Kill switch</h3><div id="riskKill" class="value">OFF</div><div id="riskKillWhy" class="muted"></div></div>
+<div class="card s4"><h3>Kill switch</h3><div id="riskKill" class="value">—</div><div id="riskKillWhy" class="muted"></div></div>
 <div class="card s8"><h3>Risk events (blocks, alerts, kills)</h3><div id="riskEvents" class="eventlog"></div></div>
 </div></section>
 
@@ -108,7 +109,7 @@
 <div class="control"><input id="op" type="password" autocomplete="off" placeholder="Operator token"><span class="muted">Held in this tab only; never sent to the event log.</span></div>
 <div class="control"><button class="action red" data-action="panic">PANIC: ENGAGE KILL SWITCH</button>
 <input id="resetWhy" placeholder="Reset reason (required)"><button class="action amber" data-action="reset-kill">Reset kill switch</button></div>
-<div class="control"><select id="esBroker"><option>ZERODHA</option><option>UPSTOX</option><option>ANGEL</option><option>KOTAK</option></select>
+<div class="control"><select id="esBroker" aria-label="Broker"><option>KOTAK</option></select>
 <label class="muted"><input id="esFlatten" type="checkbox"> also flatten positions</label>
 <button class="action red" data-action="emergency">Emergency stop broker</button>
 <button class="action blue" data-action="reconcile">Reconcile broker now</button></div></div>
@@ -127,6 +128,8 @@
 
 <section id="system" class="page" role="tabpanel"><div class="grid">
 <div class="card s6"><h3>System</h3><div id="sysMetrics"></div></div>
+<div class="card s12"><h3>Machine diagnostics</h3><div class="control"><button id="docRun" class="action" type="button">Run diagnostics</button><span class="muted">Clock, network to Kotak, static IP, login settings (format only, never values), database, Redis, instrument master, login and feed.</span></div><div id="docOut"></div></div>
+<div class="card s6"><h3>Self-repair</h3><div id="taskHealth"></div><p class="muted">Every background loop is supervised: a crash is logged and the loop restarts by itself (1 s, doubling to 60 s). Redis and the database reconnect automatically; broker feeds reconnect on the Market tab.</p></div>
 <div class="card s6"><h3>Audit chain and data loaders</h3><div id="auditMetrics"></div></div>
 <div class="card s12"><h3>Instrument masters</h3><div class="tw"><table><thead><tr><th>Broker</th><th>Records</th><th>File date</th><th>Today's</th><th>Loaded</th></tr></thead><tbody id="instRows"></tbody></table></div>
 <p class="muted">Monitoring: Prometheus metrics at <a href="/metrics" target="_blank" rel="noopener">/metrics</a> · API reference at <a href="/docs" target="_blank" rel="noopener">/docs</a></p></div>

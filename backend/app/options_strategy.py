@@ -105,13 +105,15 @@ def analyze(ladder, specs):
         lots = max(1, int(s.get('lots') or 1))
         lot = q.get('lot_size')
         if not lot:
-            warnings.append(f'LOT_SIZE_UNKNOWN:{q["symbol"]}')
+            raise StrategyError(f'LEG_{i}_LOT_SIZE_UNKNOWN:{q["symbol"]}')
+        # Always the live executable quote (sell at bid, buy at ask): a caller-supplied price is never analysed.
         quote = q['bid'] if side == 'SELL' else q['ask']
-        price = float(s['price']) if s.get('price') else (quote if quote and quote > 0 else None)
+        price = quote if quote and quote > 0 else None
         if price is None:
             raise StrategyError(f'LEG_{i}_NO_EXECUTABLE_QUOTE:{q["symbol"]}')
         if q.get('stale'):
-            warnings.append(f'STALE_QUOTE:{q["symbol"]}')
+            # No live quote, no analysis: a dead price must never produce a credit, a max loss or an order.
+            raise StrategyError(f'LEG_{i}_NO_LIVE_QUOTE:{q["symbol"]}')
         qty = lots * (lot or 1) * (1 if side == 'BUY' else -1)
         legs.append({'side': side, 'lots': lots, 'lot_size': lot, 'qty': qty, 'strike': strike, 'option_type': typ,
                      'expiry': expiry, 'kind': 'OPT', 'price': round(price, 2), 'mid': q.get('mid'), 'bid': q.get('bid'),

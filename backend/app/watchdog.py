@@ -8,7 +8,7 @@ class Watchdog:
 
     def __init__(self, timeout=5):
         self.timeout = timeout
-        self.last = time.time()
+        self.last = 0.0  # unhealthy until the first accepted live tick: no data, no heartbeat
 
     def beat(self):
         self.last = time.time()
@@ -28,6 +28,8 @@ class KillSwitch:
         self.reason = ''
         self.actor = ''
         self.at = None
+        self.persist_pending = None   # event name not yet written (database briefly down); retried
+        self.persist_error = None
 
     def load(self):
         if not self.ledger:
@@ -37,12 +39,24 @@ class KillSwitch:
             self.triggered, self.reason, self.actor, self.at = True, st.get('reason', ''), st.get('actor', ''), st.get('at')
 
     def _persist(self, event):
+        """Write the state to the ledger and audit chain. If the database is briefly unavailable the
+        in-memory state still holds (orders stay blocked) and retry_persist() writes it later; the
+        hard-stop actions that follow a trigger are never skipped because a write failed."""
         state = {'active': self.triggered, 'reason': self.reason, 'actor': self.actor, 'at': self.at}
-        if self.ledger:
-            self.ledger.set_control('kill_switch', state)
-            self.ledger.event(event, state)
-        if self.audit:
-            self.audit.append(event, self.actor or 'SYSTEM', state)
+        try:
+            if self.ledger:
+                self.ledger.set_control('kill_switch', state)
+                self.ledger.event(event, state)
+            if self.audit:
+                self.audit.append(event, self.actor or 'SYSTEM', state)
+            self.persist_pending, self.persist_error = None, None
+        except Exception as exc:  # noqa: BLE001
+            self.persist_pending, self.persist_error = event, f'{type(exc).__name__}: {str(exc)[:120]}'
+
+    def retry_persist(self):
+        if self.persist_pending:
+            self._persist(self.persist_pending)
+        return self.persist_pending is None
 
     def trigger(self, reason, actor='SYSTEM'):
         self.triggered, self.reason, self.actor = True, str(reason)[:200], actor
@@ -55,4 +69,5 @@ class KillSwitch:
         self._persist('KILL_SWITCH_RESET')
 
     def state(self):
-        return {'active': self.triggered, 'reason': self.reason, 'actor': self.actor, 'at': self.at}
+        return {'active': self.triggered, 'reason': self.reason, 'actor': self.actor, 'at': self.at,
+                'persist_pending': bool(self.persist_pending), 'persist_error': self.persist_error}

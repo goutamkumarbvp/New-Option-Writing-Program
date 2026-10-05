@@ -1,6 +1,22 @@
+import time
 from datetime import datetime, timezone
 
+from .clock import trading_date
 from .version import VERSION
+
+
+def _running(t, name, fallback):
+    """Whether a background loop is actually running, from the supervisor; the fallback applies only
+    before the terminal has started its loops (tests, or the first instant of startup)."""
+    h = getattr(t, 'task_health', {}).get(name)
+    return bool(h['running']) if h else fallback
+
+
+def _last_ticks(feed, stale_ms, n=50):
+    """Newest ticks first, each flagged stale when older than DATA_STALE_MS, so the terminal can blank them."""
+    now = int(time.time() * 1000)
+    ticks = sorted(feed.last.values(), key=lambda v: v.receive_ts_ms or 0, reverse=True)[:n]
+    return [{**v.model_dump(), 'stale': now - int(v.receive_ts_ms or 0) > stale_ms} for v in ticks]
 
 
 async def build_dashboard_state(t):
@@ -12,7 +28,10 @@ async def build_dashboard_state(t):
     snaps = {b: snap.to_dict() for b, snap in (t.risk_monitor.snapshots.items() if t.risk_monitor else [])}
     for v in snaps.values():
         v['positions'] = v['positions'][:200]
-    orders = t.ledger.orders(limit=100)
+    # Today's orders, plus any order from an earlier day that may still be working at the broker.
+    orders = t.ledger.orders(limit=100, trading_day=trading_date())
+    seen = {o['client_order_id'] for o in orders}
+    orders += [o for o in t.ledger.working_orders() if o['client_order_id'] not in seen][:50]
     filled = [o for o in orders if o['status'] in ('FILLED', 'PARTIAL') and o['avg_price'] and o['arrival_price']]
     tca = [{'client_order_id': o['client_order_id'], 'side': o['side'], 'arrival': o['arrival_price'], 'avg_fill': o['avg_price'],
             'slippage_bps': round((1 if o['side'] == 'BUY' else -1) * (o['avg_price'] - o['arrival_price']) / o['arrival_price'] * 10000, 2)}
@@ -29,17 +48,20 @@ async def build_dashboard_state(t):
             'live_trading': s.live_trading,
             'auto_trading': s.auto_trading_enabled,
             'durable_event_bus': bool(t.bus.redis_ok),
+            'event_bus': t.bus.status() if hasattr(t.bus, 'status') else None,
+            'tasks': getattr(t, 'task_health', {}),
             'event_queue_depth': t.bus.q.qsize(),
             'workers': t.stream_manager.status() if t.stream_manager else [],
-            'order_monitor': {'running': bool(t.order_monitor and not t.order_monitor.stop),
+            'order_monitor': {'running': _running(t, 'order-monitor', bool(t.order_monitor and not t.order_monitor.stop)),
                               'errors': t.order_monitor.errors if t.order_monitor else {}},
-            'risk_monitor': {'running': t.risk_monitor is not None, 'last_eval': t.risk_monitor.last_eval if t.risk_monitor else None},
+            'risk_monitor': {'running': _running(t, 'risk-monitor', t.risk_monitor is not None),
+                             'last_eval': t.risk_monitor.last_eval if t.risk_monitor else None},
         },
         'brokers': health,
         'ledger': ledger_counts,
         'orders': orders,
         'exceptions': t.ledger.ambiguous_orders(),
-        'market': {'last_ticks': [v.model_dump() for v in list(t.feed.last.values())[-50:]], 'stats': t.feed.stats(),
+        'market': {'last_ticks': _last_ticks(t.feed, s.data_stale_ms), 'stats': {**t.feed.stats(), 'data_stale_ms': s.data_stale_ms},
                    'rejected_ticks': sum(t.feed.reject_counts.values())},
         'option_chain': {'chains': t.chain.chains()[:100]},
         'instruments': t.instruments.summary(),
@@ -52,6 +74,7 @@ async def build_dashboard_state(t):
                        'max_order_value': s.max_order_value, 'max_position_qty': s.max_position_qty,
                        'max_margin_pct': s.max_margin_utilization_pct},
             'aggregate': t.risk_monitor.aggregate() if t.risk_monitor else None,
+            'snapshot_max_age_sec': s.risk_snapshot_max_age_sec,
             'snapshots': snaps,
         },
         'controls': {

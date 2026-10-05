@@ -41,6 +41,7 @@ class RiskMonitor:
         usable = [s for s in snaps if s.ok]
         return {
             'brokers': sorted(s.broker for s in snaps),
+            'usable': len(usable),
             'complete': bool(snaps) and len(usable) == len(snaps) and len(snaps) == len(self.registry.configured()),
             'total_pnl': sum(s.total_pnl or 0 for s in usable),
             'day_pnl': sum(s.day_pnl or 0 for s in usable),

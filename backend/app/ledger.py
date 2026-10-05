@@ -148,6 +148,11 @@ class Ledger:
     def __init__(self, url=None):
         url = url or settings.database_url
         kw = {'future': True, 'pool_pre_ping': True}
+        if url.startswith('postgresql'):
+            # Fail fast during a database outage instead of freezing the terminal on a stalled socket;
+            # pool_pre_ping reconnects by itself once the database is back.
+            kw.update(pool_timeout=5, pool_recycle=1800,
+                      connect_args={'connect_timeout': 3, 'options': '-c statement_timeout=10000'})
         if url.startswith('sqlite'):
             kw['connect_args'] = {'check_same_thread': False}
             if ':memory:' in url:

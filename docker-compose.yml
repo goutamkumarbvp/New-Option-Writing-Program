@@ -27,15 +27,11 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     env_file: .env
+    # The Kotak Neo login comes from section 1 of .env only (gitignored, readable by you alone). Host
+    # environment variables are deliberately not passed through: a stale value there would silently
+    # override .env and send old credentials, and every refused login counts toward Kotak's lockout.
     environment:
       DATA_DIR: /app/data
-      # Broker secrets pass through from the host environment (export them or use a secret
-      # manager) so they never need to sit in .env. A host value overrides the .env value.
-      KOTAK_API_KEY: ${KOTAK_API_KEY:-}
-      KOTAK_MOBILE: ${KOTAK_MOBILE:-}
-      KOTAK_CLIENT_CODE: ${KOTAK_CLIENT_CODE:-}
-      KOTAK_MPIN: ${KOTAK_MPIN:-}
-      KOTAK_TOTP_SECRET: ${KOTAK_TOTP_SECRET:-}
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}

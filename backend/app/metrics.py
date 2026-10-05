@@ -39,7 +39,7 @@ class Exposition:
 async def render_metrics(t):
     x = Exposition()
     x.add('iort_info', 1, 'Build information', version=VERSION)
-    x.add('iort_live_trading', settings.live_trading, 'Live order routing enabled (1) or paper mode (0)')
+    x.add('iort_live_trading', settings.live_trading, 'Live order routing enabled (1) or locked (0)')
     x.add('iort_kill_switch', t.kill.triggered, 'Persisted kill switch engaged')
     x.add('iort_market_live', t.feed.live(), 'At least one broker feed is live')
     x.add('iort_watchdog_healthy', t.watchdog.healthy(), 'Market-data watchdog healthy')
@@ -57,8 +57,12 @@ async def render_metrics(t):
         x.add('iort_broker_status', 1, 'Broker health status', broker=h.get('broker'), status=h.get('status'))
 
     for w in (t.stream_manager.status() if t.stream_manager else []):
-        x.add('iort_stream_healthy', w['healthy'], 'Stream worker receiving data', broker=w['broker'])
-        x.add('iort_stream_reconnects_total', w['reconnects'], 'Stream worker reconnects', 'counter', broker=w['broker'])
+        x.add('iort_stream_healthy', w['healthy'], 'Stream worker connected', broker=w['broker'])
+        x.add('iort_stream_state', 1, 'Stream worker state', broker=w['broker'], state=w.get('state'))
+        x.add('iort_stream_reconnects_total', w['reconnects'], 'Feed recoveries after a drop', 'counter', broker=w['broker'])
+        x.add('iort_stream_disconnects_total', w.get('failures', 0), 'Feed drops and failed connection attempts', 'counter', broker=w['broker'])
+        x.add('iort_stream_downtime_seconds_total', w.get('downtime_total_sec', 0), 'Seconds the feed was down', 'counter', broker=w['broker'])
+        x.add('iort_stream_auto_reconnect', w.get('auto_reconnect', True), 'Automatic feed reconnect enabled', broker=w['broker'])
         x.add('iort_stream_dropped_total', w['dropped'], 'Stream items dropped by back-pressure', 'counter', broker=w['broker'])
         x.add('iort_stream_dynamic_tokens', w.get('dynamic_tokens', 0), 'Runtime-managed subscriptions', broker=w['broker'])
 
@@ -70,10 +74,11 @@ async def render_metrics(t):
     x.add('iort_audit_records_total', counts['audit_records'], 'Audit-chain records', 'counter')
 
     agg = t.risk_monitor.aggregate()
-    x.add('iort_risk_total_pnl', agg['total_pnl'], 'Firm total P&L (INR) from fresh usable broker snapshots')
-    x.add('iort_risk_day_pnl', agg['day_pnl'], 'Firm day P&L (INR)')
-    x.add('iort_risk_premium_exposure', agg['premium_exposure'], 'Gross premium exposure (INR)')
-    x.add('iort_risk_short_option_notional', agg['short_option_notional'], 'Short option notional (INR, strike x qty)')
+    if agg.get('usable'):  # no live broker data: the figures are unknown, so they are omitted rather than reported as 0
+        x.add('iort_risk_total_pnl', agg['total_pnl'], 'Firm total P&L (INR) from fresh usable broker snapshots')
+        x.add('iort_risk_day_pnl', agg['day_pnl'], 'Firm day P&L (INR)')
+        x.add('iort_risk_premium_exposure', agg['premium_exposure'], 'Gross premium exposure (INR)')
+        x.add('iort_risk_short_option_notional', agg['short_option_notional'], 'Short option notional (INR, strike x qty)')
     x.add('iort_risk_complete', agg['complete'], 'Every configured broker has a fresh usable snapshot')
     for b, snap in sorted(t.risk_monitor.snapshots.items()):
         x.add('iort_risk_snapshot_ok', snap.ok, 'Broker snapshot usable for pre-trade approval', broker=b)

@@ -32,7 +32,7 @@ function stStatus(text, c = '') { $('stStatus').textContent = text; $('stStatus'
 async function stLoadStrikes() {
   const [ex, und] = stParts();
   try {
-    const r = await fetch(`/option-chain/${encodeURIComponent(ex)}/${encodeURIComponent(und)}/${encodeURIComponent(ST.sel.exp)}/ladder`, { cache: 'no-store' });
+    const r = await fetchT(`/option-chain/${encodeURIComponent(ex)}/${encodeURIComponent(und)}/${encodeURIComponent(ST.sel.exp)}/ladder`);
     ST.strikes = (await r.json()).strikes.map(s => s.strike);
   } catch { ST.strikes = []; }
 }
@@ -42,12 +42,14 @@ async function stBuild() {
   if (!ex || !ST.sel.exp) return;
   stStatus('Building…');
   const q = new URLSearchParams({ lots: $('stLots').value || 1, delta: $('stDelta').value || 0.2, wing: $('stWing').value || 4 });
-  const r = await fetch(`/strategy/template/${encodeURIComponent(ex)}/${encodeURIComponent(und)}/${encodeURIComponent(ST.sel.exp)}/${encodeURIComponent(ST.sel.tpl)}?${q}`, { cache: 'no-store' });
-  const j = await r.json();
-  if (!r.ok) { stStatus('Cannot build: ' + (j.reason || r.status), 'bad'); return; }
-  await stLoadStrikes();
-  ST.legs = j.legs.map(l => ({ side: l.side, strike: l.strike, option_type: l.option_type, lots: l.lots }));
-  ST.a = j; stStatus(`${tplLabel(ST.sel.tpl)} built from the live chain`, 'ok'); stRender();
+  try {
+    const r = await fetchT(`/strategy/template/${encodeURIComponent(ex)}/${encodeURIComponent(und)}/${encodeURIComponent(ST.sel.exp)}/${encodeURIComponent(ST.sel.tpl)}?${q}`, {}, 5000);
+    let j; try { j = await r.json(); } catch { j = { reason: 'HTTP ' + r.status }; }
+    if (!r.ok) { ST.a = null; stStatus('Cannot build: ' + (j.reason || r.status), 'bad'); stRender(); return; }
+    await stLoadStrikes();
+    ST.legs = j.legs.map(l => ({ side: l.side, strike: l.strike, option_type: l.option_type, lots: l.lots }));
+    ST.a = j; stStatus(`${tplLabel(ST.sel.tpl)} built from the live chain`, 'ok'); stRender();
+  } catch { ST.a = null; stStatus('Backend unavailable: no live data. Try again.', 'bad'); stRender(); }
 }
 
 async function stAnalyze() {
@@ -55,12 +57,13 @@ async function stAnalyze() {
   const [ex, und] = stParts();
   ST.busy = true;
   try {
-    const r = await fetch('/strategy/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const r = await fetchT('/strategy/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ exchange: ex, underlying: und, expiry: ST.sel.exp, legs: ST.legs }) });
-    const j = await r.json();
-    if (!r.ok) { stStatus('Analysis unavailable: ' + (j.reason || r.status), 'bad'); return; }
+    let j; try { j = await r.json(); } catch { j = { reason: 'HTTP ' + r.status }; }
+    // A failed re-analysis clears the numbers: an old analysis is never left on screen as current.
+    if (!r.ok) { ST.a = null; stStatus('No live analysis: ' + (j.reason || r.status), 'bad'); stRender(); return; }
     ST.a = j; stRender();
-  } catch { stStatus('Backend unavailable', 'bad'); } finally { ST.busy = false; }
+  } catch { ST.a = null; stStatus('Backend unavailable: no live data', 'bad'); stRender(); } finally { ST.busy = false; }
 }
 const stAnalyzeSoon = () => { clearTimeout(ST.timer); ST.timer = setTimeout(stAnalyze, 250); };
 
@@ -70,9 +73,9 @@ function stRender() {
     pfTile('Net credit', rupees(a.net_credit), a.net_credit >= 0 ? 'premium received' : 'premium paid', signCls(a.net_credit)) +
     pfTile('Max profit', s ? (s.unbounded_profit ? 'Unlimited' : rupees(s.max_profit)) : '—', 'at expiry', 'pos') +
     pfTile('Max loss', s ? (s.unbounded_loss ? 'Unlimited' : rupees(s.max_loss)) : '—', s?.unbounded_loss ? 'add wings to cap it' : 'at expiry', 'neg') +
-    pfTile('Breakevens', s && s.breakevens.length ? s.breakevens.map(v => Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 })).join(' · ') : '—', a.spot ? 'spot ' + fmt(a.spot) : '') +
+    pfTile('Breakevens', s && s.breakevens.length ? s.breakevens.map(v => Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 })).join(' · ') : '—', a.spot ? 'spot ' + fmt(a.spot) + (a.spot_source === 'PUT_CALL_PARITY' ? ' (parity estimate)' : '') : '') +
     pfTile('Probability of profit', a.probability_of_profit != null ? (a.probability_of_profit * 100).toFixed(1) + '%' : '—', 'model, at ATM IV') +
-    pfTile('Margin estimate', rupees(a.margin_estimate), a.margin_basis === 'MAX_LOSS_DEFINED_RISK' ? 'defined risk = max loss' : 'naked estimate; broker is authoritative') +
+    pfTile(a.margin_basis === 'MAX_LOSS_DEFINED_RISK' ? 'Margin estimate' : 'Margin (config estimate)', rupees(a.margin_estimate), a.margin_basis === 'MAX_LOSS_DEFINED_RISK' ? 'defined risk = max loss' : 'SHORT_OPTION_MARGIN_PCT; broker is authoritative') +
     pfTile('Return on margin', a.return_on_margin != null ? (a.return_on_margin * 100).toFixed(1) + '%' : '—', a.days_to_expiry != null ? a.days_to_expiry.toFixed(1) + ' days to expiry' : '') +
     pfTile('Theta / Vega', g ? `${rupees(g.theta)} / ${rupees(g.vega)}` : '—', g ? 'Δ notional ' + rupees(g.delta_notional) : 'Greeks need a spot');
   const strikeOpts = k => (ST.strikes.length ? ST.strikes : [k]).map(v => `<option value="${v}"${v === k ? ' selected' : ''}>${fmt(v)}</option>`).join('');
@@ -87,7 +90,7 @@ function stRender() {
   }).join('') || '<tr><td colspan="8" class="muted">No legs.</td></tr>';
   const warn = (a?.warnings || []).map(w => w.startsWith('NAKED_SHORTS') ? 'Naked shorts will be blocked by the order path (' + w.split(':')[1] + '). Add a long leg of the same type, or execution will stop at that short.' : w);
   $('stWarn').innerHTML = warn.map(w => `<div class="warnbox">${esc(w)}</div>`).join('') +
-    (a ? `<div class="warnbox">${CH.policy.live_trading ? 'LIVE TRADING: Execute sends real orders, one leg at a time.' : 'Paper mode: every leg is refused with LIVE_TRADING_DISABLED before any broker.'}</div>` : '');
+    (a ? `<div class="warnbox">${!('live_trading' in CH.policy) ? 'Order policy not loaded from the backend: Execute is disabled.' : CH.policy.live_trading ? 'ORDER ROUTING LIVE: Execute sends real orders, one leg at a time.' : 'Order routing is locked (LIVE_TRADING=false): every leg is refused with LIVE_TRADING_DISABLED before any broker.'}</div>` : '');
   const S1 = 'var(--series-1)', S2 = 'var(--series-2)', c = a?.curves;
   const o = !c ? { x: [], series: [], emptyText: a ? 'Payoff needs a spot price' : 'Build a strategy to see its payoff' } : {
     x: c.spots, xName: a.underlying, xFmt: v => Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 }), yFmt: rupees, zero: true, height: 300,
@@ -95,16 +98,17 @@ function stRender() {
     series: [{ name: 'At expiry', color: S1, values: c.expiry }, { name: 'Today (T+0)', color: S2, values: c.today }],
   };
   if (ST.chart) ST.chart.update(o); else ST.chart = new Charts.LineChart($('stChart'), o);
-  $('stExec').disabled = !a || ST.execBusy;
+  $('stExec').disabled = !a || ST.execBusy || !('live_trading' in CH.policy);
 }
 
 async function stExecute() {
   const a = ST.a; if (!a || ST.execBusy) return;
   const token = $('stOp').value.trim(), live = !!CH.policy.live_trading;
-  if (live && !token) { alert('Operator token required in live mode'); return; }
+  if (!('live_trading' in CH.policy)) { alert('Order policy not loaded from the backend: nothing was sent.'); return; }
+  if (live && !token) { alert('Operator token required while order routing is live'); return; }
   const order = a.execution_order.map(i => a.legs[i]);
   const lines = order.map((l, n) => `${n + 1}. ${l.side} ${Math.abs(l.qty)} × ${l.symbol} LIMIT @ ${l.price.toFixed(2)}`).join('\n');
-  if (!confirm(`Execute ${order.length} legs, hedges first:\n\n${lines}\n\n${live ? 'LIVE TRADING: these are real orders.' : 'PAPER MODE: every leg will be blocked before any broker.'}\nExecution stops at the first leg that is not accepted.`)) return;
+  if (!confirm(`Execute ${order.length} legs, hedges first:\n\n${lines}\n\n${live ? 'ORDER ROUTING LIVE: these are real orders.' : 'ORDER ROUTING LOCKED: every leg will be refused before any broker.'}\nExecution stops at the first leg that is not accepted.`)) return;
   ST.execBusy = true; $('stExec').disabled = true;
   const basket = 'strat-' + Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, '0')).join('');
   const out = [];
@@ -123,7 +127,7 @@ async function stExecute() {
       if (!ok) { out.push(`Stopped: later legs were not sent.`); break; }
     }
   } finally {
-    ST.execBusy = false; $('stExec').disabled = false;
+    ST.execBusy = false; stRender();
     $('stResult').textContent = out.join('\n');
     toast(`Strategy execution: ${out[out.length - 1]}`, out.some(x => x.startsWith('Stopped')) ? 'warn' : 'ok');
     refresh();
@@ -151,6 +155,7 @@ $('stLegs').addEventListener('click', e => {
   const b = e.target.closest('[data-remove]'); if (!b) return;
   ST.legs.splice(+b.dataset.remove, 1); stRender(); stAnalyzeSoon();
 });
+window.addEventListener('iort:state', e => { if (e.detail === null && ST.active && ST.a) { ST.a = null; stStatus('Backend unavailable: no live data', 'bad'); stRender(); } });
 window.addEventListener('iort:tab', e => { ST.active = e.detail === 'strategy'; if (ST.active) stInit().then(stRender); });
 setInterval(() => { if (ST.active && !document.hidden && ST.legs.length && !ST.execBusy && !document.activeElement?.closest?.('#stLegs')) stAnalyze(); }, 3000);
 registerPalette(() => ST.templates.map(t => ({ label: 'Strategy · ' + tplLabel(t.name), hint: t.description,

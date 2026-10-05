@@ -53,7 +53,7 @@ def implied_vol(price, S, K, T, r, option_type, lo=0.005, hi=5.0, tol=1e-6):
     f_lo = bs_price(S, K, T, r, lo, option_type) - price
     f_hi = bs_price(S, K, T, r, hi, option_type) - price
     if f_lo * f_hi > 0:
-        return lo if abs(f_lo) < abs(f_hi) else None
+        return None  # not bracketed: no volatility explains this price, so none is reported (never a floor value)
     for _ in range(200):
         mid = 0.5 * (lo + hi)
         f_mid = bs_price(S, K, T, r, mid, option_type) - price

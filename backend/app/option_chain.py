@@ -128,16 +128,27 @@ class OptionChain:
             return sum((max(k - x['strike'], 0) if x['option_type'] == 'CE' else max(x['strike'] - k, 0)) * x['oi'] for x in rows)
         return min(strikes, key=payout)
 
-    def summary(self, exchange, underlying, expiry):
-        r = self.snapshot(exchange, underlying, expiry)
+    def summary(self, exchange, underlying, expiry, now_ms=None):
+        """Chain statistics from live (non-stale) quotes only. With no live quote every statistic is
+        None: a dead feed must show blanks, not the last numbers it delivered."""
+        now_ms = now_ms or _now_ms()
+        all_rows = self.snapshot(exchange, underlying, expiry)
+        r = [x for x in all_rows if not _stale(x, now_ms)]
+        if not r:
+            return {'rows': len(all_rows), 'live_rows': 0, 'ce_oi': None, 'pe_oi': None, 'pcr': None, 'max_pain': None,
+                    'avg_iv': None}
         ce = sum(x['oi'] for x in r if x['option_type'] == 'CE')
         pe = sum(x['oi'] for x in r if x['option_type'] == 'PE')
         iv = [x['iv'] for x in r if x.get('iv') is not None and x['iv'] > 0]
-        return {'rows': len(r), 'ce_oi': ce, 'pe_oi': pe, 'pcr': pe / ce if ce else None, 'max_pain': self.max_pain(r),
-                'avg_iv': sum(iv) / len(iv) if iv else None}
+        return {'rows': len(all_rows), 'live_rows': len(r), 'ce_oi': ce, 'pe_oi': pe, 'pcr': pe / ce if ce else None,
+                'max_pain': self.max_pain(r), 'avg_iv': sum(iv) / len(iv) if iv else None}
 
-    def chains(self):
-        return [{'exchange': k[0], 'underlying': k[1], 'expiry': k[2], 'rows': len(v)} for k, v in self.data.items()]
+    def chains(self, now=None, now_ms=None):
+        """Unexpired chains with their total and live (non-stale) quote counts."""
+        now_ms = now_ms or _now_ms()
+        return [{'exchange': k[0], 'underlying': k[1], 'expiry': k[2], 'rows': len(v),
+                 'live_rows': sum(1 for x in v.values() if not _stale(x, now_ms))}
+                for k, v in self.data.items() if v and not expired(k[2], now)]
 
     def index(self, now=None):
         """Underlyings with live-fed chains and their unexpired expiries, for the terminal's selectors."""
@@ -187,7 +198,7 @@ class OptionChain:
         spot_info = spot_info or {'value': None, 'source': None, 'broker': None, 'strike': None}
         out = {'exchange': exchange, 'underlying': underlying, 'expiry': expiry, 'generated_ms': now_ms,
                'days_to_expiry': None, 'spot': spot_info, 'atm_strike': None, 'live': False, 'stale_legs': 0,
-               'summary': self.summary(exchange, underlying, expiry), 'strikes': []}
+               'summary': self.summary(exchange, underlying, expiry, now_ms), 'strikes': []}
         if not rows:
             return out
         try:
@@ -208,16 +219,20 @@ class OptionChain:
         ladder = []
         for k in strikes:
             ce, pe = pairs[k].get('CE'), pairs[k].get('PE')
-            ladder.append({'strike': k, 'pcr': (pe['oi'] / ce['oi']) if ce and pe and ce['oi'] else None, 'CE': ce, 'PE': pe})
+            live_pair = ce and pe and not ce['stale'] and not pe['stale']
+            ladder.append({'strike': k, 'pcr': (pe['oi'] / ce['oi']) if live_pair and ce['oi'] else None, 'CE': ce, 'PE': pe})
 
-        ce_vol, pe_vol = _side_sum(rows, 'CE', 'volume'), _side_sum(rows, 'PE', 'volume')
-        chg = {typ: [leg['oi_change'] for (k, t2), leg in _flat(pairs) if t2 == typ and leg['oi_change'] is not None]
-               for typ in ('CE', 'PE')}
+        fresh = [x for x in rows if not _stale(x, now_ms)]  # statistics never mix in dead quotes
+        ce_vol, pe_vol = _side_sum(fresh, 'CE', 'volume'), _side_sum(fresh, 'PE', 'volume')
+        chg = {typ: [leg['oi_change'] for (k, t2), leg in _flat(pairs)
+                     if t2 == typ and leg['oi_change'] is not None and not leg['stale']] for typ in ('CE', 'PE')}
         atm_ce, atm_pe = (pairs[atm].get('CE'), pairs[atm].get('PE')) if atm is not None else (None, None)
+        atm_ce, atm_pe = (atm_ce if atm_ce and not atm_ce['stale'] else None), (atm_pe if atm_pe and not atm_pe['stale'] else None)
         atm_ivs = [leg['iv'] for leg in (atm_ce, atm_pe) if leg and leg['iv']]
         straddle = atm_ce['mid'] + atm_pe['mid'] if atm_ce and atm_pe and atm_ce['mid'] and atm_pe['mid'] else None
         out['summary'].update({
-            'ce_volume': ce_vol, 'pe_volume': pe_vol, 'pcr_volume': pe_vol / ce_vol if ce_vol else None,
+            'ce_volume': ce_vol if fresh else None, 'pe_volume': pe_vol if fresh else None,
+            'pcr_volume': pe_vol / ce_vol if ce_vol else None,
             'ce_oi_change': sum(chg['CE']) if chg['CE'] else None, 'pe_oi_change': sum(chg['PE']) if chg['PE'] else None,
             'atm_iv': _r(sum(atm_ivs) / len(atm_ivs), 6) if atm_ivs else None,
             'atm_straddle': _r(straddle, 2),

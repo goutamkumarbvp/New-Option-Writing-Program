@@ -12,7 +12,8 @@ def authorize(token):
 
 
 def require_live_operator(token):
-    """Order-path rule: in paper mode orders are refused anyway, so only live mode needs the token."""
+    """Order-path rule: while order routing is locked (LIVE_TRADING=false) every order is refused
+    anyway, so only live routing needs the token."""
     if not settings.live_trading:
         return True
     return authorize(token)

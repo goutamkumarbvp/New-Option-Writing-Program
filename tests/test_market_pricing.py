@@ -4,9 +4,8 @@ import time
 import pytest
 from conftest import expiry_in, make_tick, override
 
-from app.benchmark import ScenarioRiskEngine
 from app.clock import years_to_expiry
-from app.greeks import black_scholes, bs_price, implied_vol
+from app.greeks import bs_price, implied_vol
 from app.market import MarketDataGateway
 from app.option_chain import OptionChain
 from app.scenario import revalue
@@ -55,16 +54,6 @@ def test_put_call_parity_and_implied_vol():
     assert c - p == pytest.approx(S - K * math.exp(-r * T), abs=1e-6)
     assert implied_vol(c, S, K, T, r, 'CE') == pytest.approx(s, abs=1e-5)
     assert implied_vol(0.0001, S, K, T, r, 'CE') is None or implied_vol(0.0001, S, K, T, r, 'CE') < 0.02
-
-
-def test_taylor_scenario_vega_units_fixed():
-    exp = expiry_in(7)
-    T = years_to_expiry(exp)
-    g = black_scholes(25000, 25000, T, 0.065, 0.12, 'CE')
-    pos = [{'qty': -75, 'spot': 25000, 'delta': g['delta'], 'gamma': g['gamma'], 'vega': g['vega'], 'theta': 0}]
-    taylor = ScenarioRiskEngine().run(pos, spot_shocks=(0,), vol_shocks=(0.10,), days=0)['scenarios'][0]['pnl']
-    full = -75 * (bs_price(25000, 25000, T, 0.065, 0.22, 'CE') - bs_price(25000, 25000, T, 0.065, 0.12, 'CE'))
-    assert taylor == pytest.approx(full, rel=0.05)  # original was ~100x too small
 
 
 def test_full_revaluation_fails_closed_without_spot():

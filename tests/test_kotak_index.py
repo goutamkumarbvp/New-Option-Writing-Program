@@ -93,7 +93,8 @@ def test_worker_subscribes_indices_and_emits_index_and_scrip_ticks():
     ws = FakeWS(w, [index_msg(name='NIFTY 50', token='26000'), scrip_msg(), index_msg(name='Nifty Bank', ltp=56010.0, token='26009')])
 
     class Client:
-        def create_websocket(self):
+        def create_websocket(self, **kw):
+            assert kw == KotakStreamWorker.SOCKET_OPTIONS  # the SDK's own reconnect loop stays off
             return ws
 
     async def session():

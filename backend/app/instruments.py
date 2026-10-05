@@ -123,13 +123,20 @@ def kotak_expiry(raw, segment, symbol=None, underlying=None, strike=None, today=
     return None
 
 
+
+def _lot(v):
+    """Lot size from the broker file, or None when the file does not give a positive one.
+    A missing lot is never assumed to be 1: the order path blocks with LOT_SIZE_UNKNOWN instead."""
+    x = _f(v)
+    return int(x) if x and x > 0 else None
+
 def normalize_row(broker, r, today=None):
     b = broker.upper()
     if b == 'ZERODHA':
         return {'token': str(r.get('instrument_token', '')), 'symbol': r.get('tradingsymbol', ''),
                 'exchange': str(r.get('exchange', '')).upper(), 'underlying': r.get('name') or None,
                 'expiry': _date(r.get('expiry')), 'strike': _f(r.get('strike')) or None,
-                'option_type': _opt(r.get('instrument_type')), 'lot_size': int(_f(r.get('lot_size')) or 1),
+                'option_type': _opt(r.get('instrument_type')), 'lot_size': _lot(r.get('lot_size')),
                 'tick_size': _f(r.get('tick_size')), 'instrument_type': r.get('instrument_type')}
     if b == 'ANGEL':
         # Angel publishes strike and tick size in paise.
@@ -139,13 +146,13 @@ def normalize_row(broker, r, today=None):
                 'underlying': r.get('name') or None, 'expiry': _date(r.get('expiry')),
                 'strike': strike / 100 if strike and strike > 0 else None,
                 'option_type': _opt(sym[-2:]) if str(r.get('instrumenttype', '')).startswith('OPT') else None,
-                'lot_size': int(_f(r.get('lotsize')) or 1), 'tick_size': None, 'instrument_type': r.get('instrumenttype')}
+                'lot_size': _lot(r.get('lotsize')), 'tick_size': None, 'instrument_type': r.get('instrumenttype')}
     if b == 'UPSTOX':
         return {'token': str(r.get('instrument_key', '')), 'symbol': r.get('trading_symbol', ''),
                 'exchange': _EXCH.get(str(r.get('segment', r.get('exchange', ''))).upper(), ''),
                 'underlying': r.get('underlying_symbol') or r.get('name') or None, 'expiry': _date(r.get('expiry')),
                 'strike': _f(r.get('strike_price')) or None, 'option_type': _opt(r.get('instrument_type')),
-                'lot_size': int(_f(r.get('lot_size')) or 1), 'tick_size': None, 'instrument_type': r.get('instrument_type')}
+                'lot_size': _lot(r.get('lot_size')), 'tick_size': None, 'instrument_type': r.get('instrument_type')}
     if b == 'KOTAK':
         # Kotak CSV headers carry stray spaces; the SDK strips them before reading columns.
         # Strike is in paise. Expiry is decoded by kotak_expiry() and stays None when the
@@ -157,7 +164,7 @@ def normalize_row(broker, r, today=None):
         seg = str(r.get('pExchSeg', '')).strip()
         return {'token': str(r.get('pSymbol', '')).strip(), 'symbol': symbol, 'exchange': _EXCH.get(seg.upper(), ''),
                 'underlying': underlying, 'expiry': kotak_expiry(r.get('pExpiryDate'), seg, symbol, underlying, strike, today),
-                'strike': strike, 'option_type': _opt(r.get('pOptionType')), 'lot_size': int(_f(r.get('lLotSize')) or 1),
+                'strike': strike, 'option_type': _opt(r.get('pOptionType')), 'lot_size': _lot(r.get('lLotSize')),
                 'tick_size': None, 'instrument_type': r.get('pInstType')}
     raise ValueError(f'UNKNOWN_BROKER:{broker}')
 

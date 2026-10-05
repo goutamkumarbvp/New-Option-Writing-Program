@@ -10,6 +10,7 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'backend'))
+os.environ['IORT_NO_DOTENV'] = '1'  # tests never read the operator's .env
 os.environ.setdefault('DATABASE_URL', 'sqlite:///:memory:')
 os.environ.setdefault('DATA_DIR', tempfile.mkdtemp(prefix='iort-test-'))
 os.environ.setdefault('REQUIRE_DURABLE_EVENT_BUS', 'false')
@@ -159,5 +160,6 @@ def live(settings_override):
     settings_override(live_trading=True, operator_api_token=TOKEN, live_production_ack='I_UNDERSTAND_REAL_ORDERS',
                       database_url='postgresql+psycopg://placeholder', require_durable_event_bus=False,
                       audit_hmac_key='test-audit-key', require_authoritative_daily_pnl=False, require_live_ltp_for_exposure=True,
-                      max_orders_per_second=1000, reconciliation_max_age_sec=3600, risk_snapshot_max_age_sec=3600)
+                      max_orders_per_second=1000, reconciliation_max_age_sec=3600, risk_snapshot_max_age_sec=3600,
+                      require_static_ip_match=False)
     return settings

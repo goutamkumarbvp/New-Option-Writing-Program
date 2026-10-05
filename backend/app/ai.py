@@ -64,8 +64,8 @@ class Agent:
         if n == 'RISK':
             blocked = bool(p.get('risk_blocked'))
             return AgentResult(n, 0.0 if blocked else 1.0, {'risk_blocked': blocked}, 'LIVE')
-        anomaly = bool(m.get('anomaly'))
-        return AgentResult(n, 0.0 if anomaly else .9, {'anomaly': anomaly}, 'LIVE')
+        # No anomaly detector is wired, so this agent reports no evidence instead of a made-up 'all clear'.
+        return AgentResult(n, 0.0, {'reason': 'NO_ANOMALY_DETECTOR'}, 'UNAVAILABLE')
 
 
 class AgentOrchestrator:

@@ -20,17 +20,17 @@ sys.path.insert(0, str(ROOT / 'backend'))
 
 
 def load_dotenv(path=ROOT / '.env'):
+    """Read .env with the terminal's own parser (backend/app/config.py), so this script sees exactly the
+    values the terminal does. The process environment wins."""
     if not path.exists():
         return False
-    for raw in path.read_text(errors='ignore').splitlines():
-        line = raw.strip()
-        if not line or line.startswith('#') or '=' not in line:
-            continue
-        k, v = line.split('=', 1)
-        v = v.split(' #', 1)[0].strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-            v = v[1:-1]
-        os.environ.setdefault(k.strip(), v)
+    import sys
+    sys.path.insert(0, str(ROOT / 'backend'))
+    from app.config import parse_env_line
+    for raw in path.read_text(encoding='utf-8-sig', errors='ignore').splitlines():
+        kv = parse_env_line(raw)
+        if kv:
+            os.environ.setdefault(*kv)
     return True
 
 
@@ -57,7 +57,7 @@ async def main():
     from app.brokers import BrokerRegistry
     from app.version import VERSION
     registry = BrokerRegistry()
-    required = [x.strip().upper() for x in os.getenv('CERT_REQUIRED_BROKERS', 'ZERODHA,UPSTOX,ANGEL,KOTAK').split(',') if x.strip()]
+    required = [x.strip().upper() for x in (os.getenv('CERT_REQUIRED_BROKERS') or os.getenv('ROUTING_BROKERS') or 'KOTAK').split(',') if x.strip()]
     results = []
     for name in required:
         if name not in registry.items:

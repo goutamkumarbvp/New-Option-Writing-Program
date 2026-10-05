@@ -1,4 +1,5 @@
 from .config import settings
+from .netcheck import PublicIP, static_ip_reasons
 
 
 class ProductionReadiness:
@@ -14,6 +15,7 @@ class ProductionReadiness:
         self.bus = bus
         self.risk_monitor = risk_monitor
         self.order_monitor = order_monitor
+        self.public_ip = PublicIP()
         self._schema = None
 
     def schema_drift(self):
@@ -46,8 +48,17 @@ class ProductionReadiness:
             reasons.append('RISK_MONITOR_NOT_RUNNING')
         if live and settings.audit_chain_required and not settings.audit_hmac_key:
             reasons.append('AUDIT_HMAC_KEY_REQUIRED')
+        if live and settings.require_static_ip_match:
+            # Kotak refuses API orders from an unregistered IP; block here with a clear reason instead.
+            reasons.extend(static_ip_reasons(await self.public_ip.get() if settings.registered_static_ip.strip() else None))
         if self.kill.triggered:
             reasons.append('KILL_SWITCH_ACTIVE')
+        tasks = getattr(self, 'task_health', None) or {}
+        if live:
+            for name in ('order-monitor', 'risk-monitor', 'reconcile'):
+                h = tasks.get(name)
+                if h is not None and not h.get('running'):
+                    reasons.append(f'BACKGROUND_TASK_DOWN:{name}')
         if target_broker:
             b = str(target_broker).upper()
             if by.get(b, {}).get('status') != 'LIVE':

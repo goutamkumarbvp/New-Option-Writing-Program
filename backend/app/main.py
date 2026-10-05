@@ -5,6 +5,7 @@ and WebSocket. Tests build their own Terminal with fake brokers and an in-memory
 ledger instead of patching module globals.
 """
 import asyncio
+import contextlib
 import json
 import time
 from contextlib import asynccontextmanager
@@ -19,9 +20,11 @@ from pydantic import BaseModel, Field
 from .audit_chain import PersistentAuditChain
 from .brokers import BrokerRegistry
 from .chain_subscriber import ChainSubscriber
+from .clock import trading_date
 from .config import settings
 from .dashboard import build_dashboard_state
 from .engine import DecisionPipeline
+from .doctor import run_doctor
 from .eventbus import EventBus
 from .health_cache import HealthCache
 from .instrument_loader import KotakInstrumentLoader, StaticInstrumentRefresher
@@ -29,7 +32,7 @@ from .instruments import InstrumentMaster
 from .ledger import Ledger
 from .metrics import render_metrics
 from .market import MarketDataGateway
-from .models import OrderRequest, Tick
+from .models import OrderRequest
 from .oms import OrderService
 from .operator_auth import require_control_operator, require_live_operator
 from .option_chain import OptionChain, resolve_spot
@@ -76,7 +79,12 @@ class Terminal:
                                              self.bus, self.risk_monitor, self.order_monitor)
         self.ws_clients = set()
         self.tasks = []
+        self.task_health = {}   # background loop name -> running / restarts / last error (self-repair telemetry)
+        self.readiness.task_health = self.task_health
+        self.restart_base_sec = 1.0
         self._bus_error_at = 0.0
+        self.bus_errors = 0
+        self._prelogin_last = {}
 
     # ------------------------------------------------------------- events
     async def emit(self, event):
@@ -85,9 +93,11 @@ class Terminal:
         try:
             await self.bus.publish(event)
         except Exception as exc:  # noqa: BLE001
+            self.bus_errors += 1
             if time.time() - self._bus_error_at > 60:
                 self._bus_error_at = time.time()
-                self.ledger.event('UI_EVENT_BUS_ERROR', {'type': event.get('type'), 'error': str(exc)[:200]})
+                with contextlib.suppress(Exception):  # emit never raises, even with the database down
+                    self.ledger.event('UI_EVENT_BUS_ERROR', {'type': event.get('type'), 'error': str(exc)[:200]})
         for q in list(self.ws_clients):
             try:
                 q.put_nowait(event)
@@ -131,27 +141,73 @@ class Terminal:
                     self.ledger.event('RECONCILE_LOOP_ERROR', {'broker': b.name, 'error': str(exc)[:200]})
             await asyncio.sleep(settings.reconcile_interval_sec)
 
+    async def _session_upkeep_loop(self):
+        """Pre-open login for brokers whose session lasts one day (Kotak), so the open starts fresh."""
+        while True:
+            for b in self.brokers.configured():
+                prelogin = getattr(b, 'prelogin', None)
+                if prelogin is None:
+                    continue
+                try:
+                    result = await prelogin()
+                except Exception as exc:  # noqa: BLE001
+                    result = f'ERROR:{type(exc).__name__}'
+                kind = result.split(':', 1)[0]
+                if kind in ('LOGGED_IN', 'FAILED', 'ERROR') and self._prelogin_last.get(b.name) != kind:
+                    with contextlib.suppress(Exception):  # log state changes only, not every 30 s retry
+                        self.ledger.event('BROKER_PRELOGIN', {'broker': b.name, 'result': result[:120]})
+                self._prelogin_last[b.name] = kind
+            # A kill switch engaged while the database was down is written as soon as it is back.
+            if self.kill.persist_pending and self.kill.retry_persist():
+                await self.emit({'type': 'KILL_SWITCH_PERSISTED', 'payload': self.kill.state()})
+            await asyncio.sleep(30 if not self.kill.persist_pending else 5)
+
     async def start(self):
+        # Nothing slow happens before the feeds start: Redis is retried in the background by bus.maintain(),
+        # and instrument masters load in the background (StaticInstrumentRefresher, KotakInstrumentLoader).
         await self.bus.connect()
         try:
-            urls = json.loads(settings.instrument_master_urls_json or '{}')
+            json.loads(settings.instrument_master_urls_json or '{}')
         except ValueError as exc:
-            urls = {}
-            self.ledger.event('INSTRUMENT_MASTER_CONFIG_ERROR', {'error': str(exc)})
-        for broker, url in urls.items():
-            if url:
-                try:
-                    await self.instruments.load_url(url, broker)
-                except Exception as exc:  # noqa: BLE001
-                    self.ledger.event('INSTRUMENT_MASTER_LOAD_ERROR', {'broker': broker, 'error': str(exc)[:300]})
+            with contextlib.suppress(Exception):
+                self.ledger.event('INSTRUMENT_MASTER_CONFIG_ERROR', {'error': str(exc)})
         self.stream_manager = StreamManager(self.handle_tick, self.emit, registry=self.brokers)
         self.readiness.stream_manager = self.stream_manager
         await self.stream_manager.start()
-        for name, coro in (('order-monitor', self.order_monitor.run()), ('risk-monitor', self.risk_monitor.run()),
-                           ('reconcile', self._reconcile_loop()), ('bus-drain', self._drain_bus()),
-                           ('instrument-loader', self.instrument_loader.run()), ('chain-subscriber', self.chain_subscriber.run()),
-                           ('static-instrument-refresh', self.static_refresher.run())):
-            self.tasks.append(asyncio.create_task(coro, name=name))
+        for name, loop in (('order-monitor', self.order_monitor.run), ('risk-monitor', self.risk_monitor.run),
+                           ('reconcile', self._reconcile_loop), ('bus-drain', self._drain_bus),
+                           ('event-bus-reconnect', self.bus.maintain), ('session-upkeep', self._session_upkeep_loop),
+                           ('instrument-loader', self.instrument_loader.run), ('chain-subscriber', self.chain_subscriber.run),
+                           ('static-instrument-refresh', self.static_refresher.run)):
+            self.tasks.append(asyncio.create_task(self._supervise(name, loop), name=name))
+
+    async def _supervise(self, name, loop):
+        """Keep one background loop alive. A crash is recorded and the loop restarted after 1 s,
+        doubling up to 60 s while it keeps crashing within a minute of starting. A loop that
+        returns by itself was stopped on purpose and is not restarted."""
+        h = self.task_health.setdefault(name, {'running': False, 'restarts': 0, 'last_error': None, 'last_crash_at': None})
+        delay = self.restart_base_sec
+        while True:
+            started = time.monotonic()
+            h['running'] = True
+            try:
+                await loop()
+                h['running'] = False
+                return
+            except asyncio.CancelledError:
+                h['running'] = False
+                raise
+            except Exception as exc:  # noqa: BLE001 - restart, never let a background loop die silently
+                if time.monotonic() - started > 60:
+                    delay = self.restart_base_sec
+                h.update(running=False, restarts=h['restarts'] + 1, last_crash_at=time.time(),
+                         last_error=f'{type(exc).__name__}: {str(exc)[:160]}')
+                with contextlib.suppress(Exception):
+                    self.ledger.event('TASK_RESTART', {'task': name, 'error': h['last_error'], 'restart_in_sec': delay})
+                with contextlib.suppress(Exception):
+                    await self.emit({'type': 'TASK_RESTART', 'task': name, 'error': h['last_error'], 'restart_in_sec': delay})
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
 
     async def stop(self):
         self.order_monitor.stop = True
@@ -211,6 +267,12 @@ def create_app(t: Terminal, run_background=True):
     async def readyz():
         return await t.readiness.check()
 
+    @app.get('/livez')
+    def livez():
+        """Process liveness only: answers at once and touches no broker, database or Redis. Docker's
+        health check uses it, so a slow broker login never marks the container unhealthy."""
+        return {'status': 'UP', 'version': VERSION}
+
     @app.get('/health')
     async def health():
         return {'status': 'OK', 'version': VERSION, 'market': 'LIVE' if t.feed.live() else 'DATA_UNAVAILABLE',
@@ -223,8 +285,10 @@ def create_app(t: Terminal, run_background=True):
         return await build_dashboard_state(t)
 
     @app.get('/dashboard/orders')
-    def dashboard_orders(broker: Optional[str] = None, limit: int = 200):
-        return {'orders': t.ledger.orders(broker, limit=max(1, min(limit, 5000)))}
+    def dashboard_orders(broker: Optional[str] = None, limit: int = 200, day: Optional[str] = None):
+        """Orders of one IST trading day (default today); day=all returns history across days."""
+        d = None if day == 'all' else (day or trading_date())
+        return {'orders': t.ledger.orders(broker, limit=max(1, min(limit, 5000)), trading_day=d), 'trading_day': d}
 
     @app.get('/dashboard/audit')
     def dashboard_audit(limit: int = 100):
@@ -240,13 +304,6 @@ def create_app(t: Terminal, run_background=True):
     def risk_portfolio():
         """Position Greeks, per-underlying and firm aggregates, scenario grid and payoff curves (read-only)."""
         return build_portfolio(t.risk_monitor.snapshots, t.feed, t.chain)
-
-    @app.post('/market/tick')
-    async def tick(tk: Tick):
-        # Production ticks come only from authenticated broker streams.
-        if settings.live_trading:
-            return JSONResponse({'status': 'BLOCKED', 'reason': 'EXTERNAL_TICK_INGEST_DISABLED_IN_LIVE'}, status_code=403)
-        return await t.handle_tick(tk)
 
     @app.get('/option-chain')
     def option_chain_index():
@@ -285,10 +342,6 @@ def create_app(t: Terminal, run_background=True):
             return analyze(ladder, list(payload.get('legs') or [])[:12])
         except (StrategyError, TypeError, ValueError) as exc:
             return JSONResponse({'status': 'UNAVAILABLE', 'reason': str(exc)}, status_code=422)
-
-    @app.post('/decision')
-    def decision(o: OrderRequest):
-        return {'status': 'READINESS_REQUIRED', 'message': 'Use /orders; /decision does not authorize live execution.'}
 
     @app.post('/orders')
     async def orders(o: OrderRequest, x_iort_operator_token: Optional[str] = Header(default=None)):
@@ -398,9 +451,40 @@ def create_app(t: Terminal, run_background=True):
         before = b.login_state()
         after = b.reset_login()
         t.health.at = 0.0  # next health read reflects the reset instead of the cached halt
+        if t.stream_manager:  # a feed waiting on the halted login retries now
+            t.stream_manager.request_reconnect(b.name, reason='LOGIN_RESET')
         t.ledger.event('BROKER_LOGIN_RESET', {'broker': b.name, 'before': before})
         t.audit.append('BROKER_LOGIN_RESET', 'OPERATOR', {'broker': b.name, 'was_halted': before['halted']})
         return {'status': 'RESET', 'broker': b.name, 'before': before, 'login': after}
+
+    @app.post('/brokers/{broker}/reconnect')
+    async def broker_reconnect(broker: str, relogin: bool = False, x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Drop and reopen a broker's market-data feed now, skipping any backoff wait.
+        relogin=true also forces a fresh broker login first (login backoff and lockout halt still apply)."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        if broker_or_404(broker) is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        r = t.stream_manager.request_reconnect(broker, relogin=relogin) if t.stream_manager else None
+        if r is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'NO_STREAM_FOR_BROKER'}, status_code=409)
+        t.ledger.event('STREAM_RECONNECT_REQUEST', r)
+        t.audit.append('STREAM_RECONNECT_REQUEST', 'OPERATOR', {'broker': r['broker'], 'relogin': bool(relogin)})
+        await t.emit({'type': 'STREAM_RECONNECTING', **r})
+        return {'status': 'RECONNECTING', **r}
+
+    @app.post('/brokers/{broker}/auto-reconnect')
+    async def broker_auto_reconnect(broker: str, enabled: bool = True, x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Turn automatic feed reconnect on or off for one broker (on by default; off pauses after a drop)."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        if broker_or_404(broker) is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
+        r = t.stream_manager.set_auto_reconnect(broker, enabled) if t.stream_manager else None
+        if r is None:
+            return JSONResponse({'status': 'BLOCKED', 'reason': 'NO_STREAM_FOR_BROKER'}, status_code=409)
+        t.audit.append('STREAM_AUTO_RECONNECT', 'OPERATOR', {'broker': r['broker'], 'enabled': r['auto_reconnect']})
+        return {'status': 'OK', **r}
 
     @app.post('/instruments/refresh/{broker}')
     async def refresh_instruments(broker: str, x_iort_operator_token: Optional[str] = Header(default=None)):
@@ -413,14 +497,6 @@ def create_app(t: Terminal, run_background=True):
             return JSONResponse({'status': 'BLOCKED', 'reason': 'KOTAK_AUTO_LOAD_DISABLED_OR_UNCONFIGURED'}, status_code=400)
         r = await t.instrument_loader.run_once(force=True)
         return JSONResponse(r, status_code=502 if r and r.get('status') == 'ERROR' else 200)
-
-    @app.post('/instruments/load/{broker}')
-    async def load_instruments(broker: str, url: str = Body(embed=True), x_iort_operator_token: Optional[str] = Header(default=None)):
-        if not require_control_operator(x_iort_operator_token):
-            return denied()
-        if broker_or_404(broker) is None:
-            return JSONResponse({'status': 'BLOCKED', 'reason': 'UNKNOWN_BROKER'}, status_code=404)
-        return await t.instruments.load_url(url, broker)
 
     @app.websocket('/ws/events')
     async def ws(w: WebSocket):
@@ -445,6 +521,12 @@ def create_app(t: Terminal, run_background=True):
         finally:
             t.ws_clients.discard(q)
 
+    @app.get('/ops/doctor')
+    async def ops_doctor():
+        """Machine and login diagnostics: clock, Kotak reachability, static IP, credential format
+        (never values), database, Redis, instrument master, login and feed. Read-only."""
+        return await run_doctor(t, public_ip=t.readiness.public_ip)
+
     @app.get('/metrics')
     async def prometheus_metrics():
         return PlainTextResponse(await render_metrics(t), media_type='text/plain; version=0.0.4; charset=utf-8')
@@ -465,55 +547,9 @@ def create_app(t: Terminal, run_background=True):
 
 
 def _register_calculators(app, t):
-    """Stateless analytics calculators. They do not touch orders or broker state."""
-    from .benchmark import (AlgoOrderPlanner, AutoHedger, ExecutionTCA, HAReadiness, PortfolioGreeks, PreTradePortfolioRisk,
-                            ScenarioRiskEngine, SelfTradePrevention, VolPoint, VolSurfaceEngine)
-    from .enterprise_controls import ComplianceGuard, DRRunbook, HealthBudget
-    from .scenario import revalue
-    vol, scen, greeks, pre = VolSurfaceEngine(), ScenarioRiskEngine(), PortfolioGreeks(), PreTradePortfolioRisk()
-    stp, hedger, algo, tca, ha = SelfTradePrevention(), AutoHedger(), AlgoOrderPlanner(), ExecutionTCA(), HAReadiness()
-    compliance, dr, budget = ComplianceGuard(), DRRunbook(), HealthBudget()
-
-    app.post('/analytics/vol-surface')(lambda payload=Body(...): vol.fit_smile(
-        float(payload.get('spot', 0)), [VolPoint(float(x['strike']), float(x['iv']), float(x.get('weight', 1))) for x in payload.get('points', [])]))
-    app.post('/risk/scenarios')(lambda payload=Body(...): scen.run(
-        payload.get('positions', []), tuple(payload.get('spot_shocks', [-.05, 0, .05])),
-        tuple(payload.get('vol_shocks', [-.10, 0, .10])), float(payload.get('days', 1))))
-    app.post('/risk/scenarios/full')(lambda payload=Body(...): revalue(payload.get('positions', []), payload.get('spots', {})))
-    app.post('/risk/portfolio-greeks')(lambda payload=Body(...): greeks.aggregate(payload.get('positions', [])))
-    app.post('/risk/pretrade-portfolio')(lambda payload=Body(...): pre.assess(
-        payload.get('order', {}), payload.get('portfolio', {}), payload.get('scenarios', {}), payload.get('limits', {})))
-    app.post('/risk/self-trade-check')(lambda payload=Body(...): stp.check(payload.get('order', {}), payload.get('working_orders', [])))
-    app.post('/hedge/delta')(lambda payload=Body(...): hedger.delta_hedge(
-        float(payload.get('net_delta', 0)), float(payload.get('hedge_delta', 0)), int(payload.get('lot_size', 1))))
-    app.post('/algo/iceberg')(lambda payload=Body(...): algo.iceberg(int(payload.get('qty', 0)), int(payload.get('disclosed', 0))))
-    app.post('/algo/twap')(lambda payload=Body(...): algo.twap(int(payload.get('qty', 0)), int(payload.get('slices', 0)),
-                                                              int(payload.get('start_ms', 0)), int(payload.get('end_ms', 0))))
-    app.post('/analytics/tca')(lambda payload=Body(...): tca.summarize(payload.get('fills', []), float(payload.get('arrival_price', 0)),
-                                                                      str(payload.get('side', 'BUY'))))
-    app.post('/ops/ha-readiness')(lambda payload=Body(...): ha.assess(payload))
-    app.get('/enterprise/readiness')(lambda: budget.assess({'database': True, 'event_bus': t.bus is not None,
-                                                            'stream_manager': t.stream_manager is not None,
-                                                            'order_monitor': not t.order_monitor.stop, 'risk_monitor': not t.risk_monitor.stop}))
-
-    @app.post('/enterprise/compliance-check')
-    def enterprise_compliance(payload: dict = Body(...)):
-        # Calculator only: role comes from the caller and is NOT an authorization decision.
-        return compliance.validate(payload.get('order', {}), role=payload.get('role', 'TRADER'), kill=t.kill.triggered,
-                                   live=settings.live_trading)
-
-    @app.post('/enterprise/dr-failover')
-    def enterprise_dr(payload: dict = Body(...), x_iort_operator_token: Optional[str] = Header(default=None)):
-        if not require_control_operator(x_iort_operator_token):
-            return JSONResponse({'status': 'BLOCKED', 'reason': 'OPERATOR_AUTH_REQUIRED'}, status_code=401)
-        return dr.failover(bool(payload.get('primary_ok')), bool(payload.get('secondary_ok')))
-
-    @app.post('/enterprise/audit')
-    def enterprise_audit(payload: dict = Body(...), x_iort_operator_token: Optional[str] = Header(default=None)):
-        if not require_control_operator(x_iort_operator_token):
-            return JSONResponse({'status': 'BLOCKED', 'reason': 'OPERATOR_AUTH_REQUIRED'}, status_code=401)
-        return {'hash': t.audit.append(str(payload.get('action', 'UNKNOWN')), 'OPERATOR', payload.get('payload', {}))}
-
+    """Read-only verification of the persistent audit chain. The earlier calculator endpoints that
+    computed answers from caller-supplied hypothetical inputs (scenarios, TCA, hedges, algos,
+    compliance, DR) were removed: the terminal only reports on live broker and market data."""
     app.get('/enterprise/audit/verify')(lambda: t.audit.verify())
 
 

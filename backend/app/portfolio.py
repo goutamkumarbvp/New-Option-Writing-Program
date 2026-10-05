@@ -11,6 +11,7 @@ priced are listed with the reason and make the affected totals 'complete: false'
 """
 import time
 
+from .config import settings
 from .analytics import gamma_pnl, leg_greeks, payoff_curves
 from .clock import expired
 from .option_chain import resolve_spot
@@ -43,7 +44,13 @@ def build_portfolio(snapshots, feed, chain, now_ms=None):
     now_ms = now_ms or int(time.time() * 1000)
     brokers, positions, cache = {}, [], {}
     for name, snap in sorted(snapshots.items()):
-        brokers[name] = {'ok': snap.ok, 'age_sec': round(snap.age(), 2), 'error': snap.error, 'issues': snap.issues[:20],
+        age = snap.age()
+        if age > settings.risk_snapshot_max_age_sec:
+            # An old snapshot is not live broker data: report the broker as missing and show none of its positions.
+            brokers[name] = {'ok': False, 'age_sec': round(age, 2), 'error': 'SNAPSHOT_STALE', 'issues': [],
+                             'total_pnl': None, 'day_pnl': None, 'day_pnl_source': None}
+            continue
+        brokers[name] = {'ok': snap.ok, 'age_sec': round(age, 2), 'error': snap.error, 'issues': snap.issues[:20],
                          'total_pnl': snap.total_pnl, 'day_pnl': snap.day_pnl, 'day_pnl_source': snap.day_pnl_source}
         for p in snap.positions:
             if not p.get('qty'):
@@ -94,11 +101,12 @@ def build_portfolio(snapshots, feed, chain, now_ms=None):
                             'payoff': payoff})
 
     totals = {k: sum(u[k] or 0 for u in underlyings) for k in SUMMABLE}
-    totals.update(positions=len(positions), complete=all(u['complete'] for u in underlyings) and all(b['ok'] for b in brokers.values()),
+    totals.update(positions=len(positions),
+                  complete=bool(brokers) and all(u['complete'] for u in underlyings) and all(b['ok'] for b in brokers.values()),
                   total_pnl=sum(b['total_pnl'] or 0 for b in brokers.values()),
                   day_pnl=sum(b['day_pnl'] or 0 for b in brokers.values()))
     priced = [{'qty': r['qty'], 'price': r['price'], 'option_type': r['option_type'], 'strike': r['strike'], 'expiry': r['expiry'],
                'underlying': r['underlying'], 'iv': r['iv'], 'symbol': r['symbol'], 'token': r['token']} for r in positions]
-    scenarios = revalue(priced, spots) if positions else {'ok': True, 'worst_pnl': 0.0, 'scenarios': [], 'legs': 0}
+    scenarios = revalue(priced, spots) if positions else {'ok': True, 'worst_pnl': None, 'scenarios': [], 'legs': 0}
     return {'as_of_ms': now_ms, 'brokers': brokers, 'positions': positions, 'underlyings': underlyings, 'totals': totals,
             'scenarios': scenarios}

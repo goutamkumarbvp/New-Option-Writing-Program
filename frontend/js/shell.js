@@ -21,22 +21,32 @@ function sessionState(p, open, close, preOpen) {
   if (preOpen != null && p.min >= preOpen && p.min < open) return ['PRE-OPEN', 'warn'];
   return p.min >= open && p.min < close ? ['OPEN', 'ok'] : ['CLOSED', ''];
 }
+// Session hours come from the clock, so an OPEN pill also needs a live feed: hours with no live
+// data (a holiday, or the feed is down) read 'HOURS · NO FEED', never a plain green OPEN.
+let FEED_LIVE = false;
+function sessionPill(id, name, state, c) {
+  if (state === 'OPEN' && !FEED_LIVE) { $(id).textContent = name + ' HOURS · NO FEED'; cls($(id), 'warn'); return; }
+  $(id).textContent = name + ' ' + state; cls($(id), c);
+}
 function tickClock() {
   const p = istParts();
   $('clock').textContent = 'IST ' + p.text;
   const [n, nc] = sessionState(p, 9 * 60 + 15, 15 * 60 + 30, 9 * 60);
-  $('nsePill').textContent = 'NSE ' + n; cls($('nsePill'), nc);
+  sessionPill('nsePill', 'NSE', n, nc);
   const mcxClose = usDaylightSaving() ? 23 * 60 + 30 : 23 * 60 + 55; // MCX follows US daylight saving
   const [m, mc] = sessionState(p, 9 * 60, mcxClose);
-  $('mcxPill').textContent = 'MCX ' + m; cls($('mcxPill'), mc);
+  sessionPill('mcxPill', 'MCX', m, mc);
 }
 
 window.addEventListener('iort:state', ev => {
-  const skew = Object.values(ev.detail.market?.stats?.median_skew_ms || {}).filter(v => v != null);
+  // Latency only from brokers whose feed is live right now; a dead feed shows no number.
+  const st = ev.detail?.market?.stats || {}, live = st.live_brokers || [];
+  FEED_LIVE = live.length > 0; tickClock();
+  const skew = Object.entries(st.median_skew_ms || {}).filter(([b, v]) => v != null && live.includes(b)).map(([, v]) => v);
   const el = $('latPill');
-  if (!skew.length) { el.textContent = 'FEED —'; cls(el, ''); return; }
+  if (!skew.length) { el.textContent = 'LATENCY —'; cls(el, ''); return; }
   const worst = Math.max(...skew);
-  el.textContent = `FEED ${Math.round(worst)} ms`;
+  el.textContent = `LATENCY ${Math.round(worst)} ms`;
   cls(el, worst < 500 ? 'ok' : worst < 1500 ? 'warn' : 'bad');
 });
 
@@ -66,7 +76,10 @@ const TOAST_RULES = {
   FILL: ['ok', e => `Fill ${p_(e).side || ''} ${p_(e).qty || p_(e).filled_qty || ''} ${p_(e).symbol || ''} @ ${p_(e).price || p_(e).avg_price || ''}`],
   INSTRUMENT_MASTER_LOADED: ['ok', e => `${p_(e).broker} instrument master loaded: ${fmt(p_(e).count)} contracts`],
   INSTRUMENT_MASTER_LOAD_ERROR: ['warn', e => `${p_(e).broker} instrument master failed; retry in ${p_(e).retry_in_sec}s`],
-  STREAM_ERROR: ['warn', e => `${e.broker} stream: ${String(e.error || '').slice(0, 90)}`],
+  STREAM_ERROR: ['warn', e => `${e.broker} feed: ${String(e.error || '').slice(0, 90)}${e.next_retry_in != null ? ` · retry in ${e.next_retry_in}s` : ''}`],
+  STREAM_DISCONNECTED: ['bad', e => `${e.broker} feed disconnected (${String(e.reason || '').slice(0, 60)}). Reconnecting…`],
+  STREAM_CONNECTED: ['ok', e => e.recovered ? `${e.broker} feed reconnected after ${Math.round(e.downtime_sec || 0)} s` : `${e.broker} feed connected`],
+  STREAM_RECONNECTING: ['ok', e => `${e.broker} feed: reconnecting now${e.relogin ? ' with a fresh login' : ''}`],
 };
 window.addEventListener('iort:event', ev => {
   const rule = TOAST_RULES[ev.detail.type];
@@ -111,6 +124,7 @@ function paletteItems() {
     { label: 'Toggle Greeks in the option chain', hint: 'G', run: () => { showTab('chain'); $('chGreeks').click(); } },
     { label: 'Refresh data now', hint: 'R', run: () => refresh() },
     { label: 'Reconcile selected broker now…', hint: 'operator', run: () => { showTab('execution'); reconcileNow(); } },
+    ...((LAST.system || {}).workers || []).map(w => ({ label: `Reconnect ${w.broker} feed now`, hint: 'operator', run: () => reconnectFeed(w.broker) })),
     { label: 'Engage kill switch…', hint: 'confirm', danger: true, run: () => { showTab('execution'); if (confirm('Engage the kill switch now? New orders will be blocked.')) panic(); } },
     { label: 'Open Prometheus metrics', hint: '/metrics', run: () => window.open('/metrics', '_blank', 'noopener') },
     { label: 'Open API reference', hint: '/docs', run: () => window.open('/docs', '_blank', 'noopener') },

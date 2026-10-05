@@ -1,11 +1,19 @@
-# Institutional Options Risk Terminal (IORT) 3.2.0
+# Institutional Options Risk Terminal (IORT) 3.3.0
 
 An options risk and option-writing terminal for NSE, BSE and MCX: multi-broker live feeds, a live option chain, portfolio risk with Greeks and full-revaluation scenarios, a strategy builder for hedged option writing, and a pre-trade risk engine that every order passes through.
 
 ## Status
-**3.2.0: production-preparation candidate.** The build is deliberately fail-closed: missing evidence blocks orders instead of guessing. `LIVE_TRADING` defaults to false, and live money still needs the controlled evidence listed under *Live-money gate*. It is not a profitability guarantee, an exchange certification, or a claim of equivalence to commercial terminals.
+**3.3.0: production-preparation candidate.** The build is deliberately fail-closed: missing evidence blocks orders instead of guessing. It shows live broker data only, and blank where there is none. `LIVE_TRADING` defaults to false (order routing locked), and live money still needs the controlled evidence listed under *Live-money gate*. It is not a profitability guarantee, an exchange certification, or a claim of equivalence to commercial terminals.
 
-## What is new in 3.2.0
+## What is new in 3.3.0
+- **Live data only.** No simulated, sample or caller-supplied data reaches the screen or a decision. The HTTP tick-injection endpoint, the calculator endpoints that worked on made-up inputs, and the placeholder modules behind them are gone. Without live data every price, chain, P&L, Greek and chart is blank. A quote older than `DATA_STALE_MS` is blanked, and the strategy builder refuses it. When the backend stops answering, every panel blanks within 7 s. `LIVE_TRADING=false` is now labelled **ORDERS LOCKED**: it is an order interlock, not a "paper" mode.
+- **Kotak login that repairs itself.** It detects an expired session (gateway 401/900901, SDK refusals), logs in again and repeats the call once. Logins happen before the open (08:50 IST) and at day rollover, never at random midday. The TOTP window is never reused, and the TOTP code is computed on Kotak's clock when this machine's clock has drifted. Format errors (mobile, MPIN, UCC, TOTP secret) are caught before anything is sent. Maintenance pages and 5xx replies back off for 5 to 60 s and never count as a wrong password. A re-login budget prevents storms. Health reports `LIVE` only after a real authenticated call.
+- **Immediate feed reconnect.** A dropped Kotak feed reconnects at once, then after 1, 2, 5, 10 and 20 s (cap 30 s). The backoff resets after a healthy connection, and a forced fresh login follows repeated failures. The Market tab has **Reconnect now** and an **Auto** switch; the Overview card and header pill show the feed state, and toasts announce disconnects and recoveries. API: `POST /brokers/{broker}/reconnect`, `POST /brokers/{broker}/auto-reconnect`.
+- **Self-repair.** Every background loop is supervised and restarted after a crash. Redis reconnects, and its stalls can no longer freeze ticks. Postgres calls time out instead of hanging. A kill switch engaged while the database is down holds in memory and is written when it returns. The browser reconnects its event stream with a heartbeat watchdog. Live readiness blocks orders while a critical loop is down. `/livez` is the container health check.
+- **Windows machine kit** (`deploy/windows`): installer, start/stop/update/backup/logs/doctor scripts, autostart, and a step-by-step guide. **Machine diagnostics** (`GET /ops/doctor`, System tab) checks the clock against Kotak, reachability of each Kotak host, static IP, login settings (format only, never values), database, Redis, instrument master, login and feed.
+- **`.env` for Kotak Neo login.** Section 1 of `.env` is the Kotak Neo login. The terminal reads `.env` itself when run without Docker; bad values are reported by name and block order routing instead of crashing it. With live order routing, `REGISTERED_STATIC_IP` must match this machine's public IP.
+
+## 3.2.0
 - **Option Chain:** strike ladder with OI, OI change, IV and Greeks, ATM/ITM/spot markers, OI and OI-change charts, IV smile, and a click-to-trade ticket.
 - **Portfolio:** broker-authoritative positions with model IV and Greeks, firm totals in rupees, payoff curves and a spot × vol scenario heatmap.
 - **Strategy builder:** short straddles, strangles, iron condors and flies, and credit spreads picked from the live chain by delta. It shows exact max profit and loss, breakevens, probability of profit, margin estimate, and hedge-first execution.
@@ -53,7 +61,7 @@ The web terminal's **Option Chain** tab shows a strike ladder per underlying and
 - Spot is a live index or cash tick of the underlying (for example a streamed Kotak "Nifty 50"), or the token named in `UNDERLYING_SPOT_TOKENS_JSON`. Without either, spot is a labelled put-call parity estimate. With none, ATM, model IV and Greeks are left blank.
 - Charts under the ladder show open interest and OI change by strike (calls vs puts, ATM highlighted) and the IV smile with a spot marker. Every chart has a hover and keyboard readout; the ladder is its table view.
 - IV and Greeks are Black-Scholes values from the quote mid. OI change counts from the first tick the terminal saw today.
-- Clicking a **Bid** opens a SELL (write) ticket and an **Ask** opens a BUY ticket. Tickets submit to `POST /orders` with the row's explicit broker and a client order ID, so every pre-trade control, the kill switch and operator auth still apply. Paper mode refuses them with `LIVE_TRADING_DISABLED`.
+- Clicking a **Bid** opens a SELL (write) ticket and an **Ask** opens a BUY ticket. Tickets submit to `POST /orders` with the row's explicit broker and a client order ID, so every pre-trade control, the kill switch and operator auth still apply. With order routing locked (`LIVE_TRADING=false`) they are refused with `LIVE_TRADING_DISABLED`.
 - API: `GET /option-chain` lists chains and order policy; `GET /option-chain/{exchange}/{underlying}/{expiry}/ladder?depth=N` returns the ladder.
 
 ## Portfolio tab
@@ -70,7 +78,15 @@ The **Strategy** tab and `GET /strategy/template/{exchange}/{underlying}/{expiry
 - Analysis (`POST /strategy/analyze`): legs are priced at executable quotes (sell at bid, buy at ask). It returns net credit, exact max profit and loss with unbounded detection, breakevens, net Greeks, payoff curves, a model probability of profit at ATM IV, and a margin estimate. The estimate is max loss for defined risk and `SHORT_OPTION_MARGIN_PCT` otherwise; the broker is authoritative.
 - **Execute, hedges first** sends legs one at a time through `POST /orders`, buy legs first. It stops at the first leg that is not accepted. The order path blocks a new short until its hedge is in the book, and naked shorts are flagged before you send.
 
+## Self-repair
+- Background loops (order monitor, risk monitor, reconciliation, loaders, chain subscriber, session upkeep, Redis reconnect) run under a supervisor that restarts a crashed loop after 1 s, doubling to 60 s. The System tab lists each loop and its restarts. Live readiness adds `BACKGROUND_TASK_DOWN:<loop>` while the order monitor, risk monitor or reconciliation is down.
+- Redis has 2 s socket timeouts and reconnects every 5 s; market ticks never wait on it. Postgres calls time out after 3 s (connect) and 10 s (statement), and `pool_pre_ping` reconnects after an outage. `Terminal.emit` never raises.
+- A kill switch engaged while the database is unavailable stays engaged in memory and is persisted as soon as the database returns.
+- Settings that cannot be parsed fall back to their defaults, are reported as `CONFIG_INVALID:<KEY>` and block live order routing; they never stop the terminal.
+- `GET /livez` answers at once and touches no broker, database or Redis; the container health check uses it.
+
 ## Operations
+- `GET /ops/doctor` (System tab, **Run diagnostics**) and `python -m app.doctor [--login]` check the machine: clock against Kotak, each Kotak host, public vs registered static IP, login settings (format only, never values), database, Redis, instrument master, login and feed.
 - `GET /metrics` serves Prometheus text format: feed liveness and rejections by reason, broker and stream health, orders by status, ambiguous orders, firm P&L and exposure, snapshot freshness, instrument masters, loaders and auto-subscribed tokens.
 - Brokers with a fixed URL in `INSTRUMENT_MASTER_URLS_JSON` (Zerodha, Angel, Upstox) reload once a day after `INSTRUMENT_REFRESH_AFTER_IST` (08:30), when the new file is published.
 
@@ -80,7 +96,8 @@ The **Strategy** tab and `GET /strategy/template/{exchange}/{underlying}/{expiry
 - Keyboard: **Ctrl/⌘+K** command palette, **Alt+1–9** tabs, **?** help, **Esc** closes dialogs, **R** refreshes, **G** toggles Greeks. Shortcuts never place orders, and every order and control action asks for confirmation.
 
 ## Kotak Neo notes
-- **Login backoff.** A failed Kotak login waits 30, 60, 120 … seconds (capped at 15 minutes) before the next attempt, however many components ask for a session. Network, proxy, timeout and server errors only back off.
+- **Login backoff.** A refused Kotak login waits 30, 60, 120 … seconds (capped at 15 minutes) before the next attempt, however many components ask for a session. Network, proxy, timeout, maintenance and server errors retry after 5, 10, 20, 40 s (cap 60 s) and never count as a refusal.
+- **Session upkeep.** A session lasts the IST trading day. It is replaced at day rollover, before the open (`KOTAK_PRELOGIN_IST`, 08:50), or at once when Kotak ends it; the call that found the expiry is repeated once. At most `KOTAK_RELOGIN_BUDGET` such re-logins happen per 15 minutes.
 - **Lockout protection.** When Kotak itself rejects the credentials twice in a row, automatic login halts and the dashboard shows `LOGIN_HALTED`. Fix the credentials, then press **Reset KOTAK login** on the Overview tab or call `POST /brokers/KOTAK/login-reset` with the operator token. Tune with `KOTAK_LOGIN_BACKOFF_SEC`, `KOTAK_LOGIN_BACKOFF_MAX_SEC` and `KOTAK_LOGIN_MAX_REJECTIONS`.
 - **Expiry decoding.** `pExpiryDate` follows the official SDK rule: NSE F&O adds 315511200 seconds, BSE F&O and MCX are plain Unix seconds. A decoded date must be plausible and must match the trading symbol's month or weekly date; otherwise expiry stays empty and option gates fail closed. This lets Kotak option ticks populate the Option Chain tab.
 - **Automatic instrument master.** Kotak publishes a new scrip master every day under a dated path. With `KOTAK_API_KEY` set, the terminal asks Kotak for the day's file paths, loads the `KOTAK_SCRIP_SEGMENTS` files together and checks again every `INSTRUMENT_REFRESH_CHECK_SEC`. This needs only the consumer key, not a login.
@@ -99,10 +116,11 @@ The **Strategy** tab and `GET /strategy/template/{exchange}/{underlying}/{expiry
 - The SDK writes `logs/neo-api-client.log` in the working directory, including mobile number and client code. `logs/` is gitignored.
 
 ## Credentials
-Broker credentials never go in chat, git or `.env`. Set them as environment variables: `KOTAK_API_KEY`, `KOTAK_MOBILE`, `KOTAK_CLIENT_CODE`, `KOTAK_MPIN` and `KOTAK_TOTP_SECRET`.
-- In a cloud session, add them in the environment settings.
-- On a server, use its secret store or export them before `docker compose up`; compose passes them through to the terminal.
-- Process environment variables take precedence over `.env`.
+Put the Kotak Neo login in **section 1 of `.env`** on your own machine: `KOTAK_API_KEY`, `KOTAK_MOBILE` (`+91` and 10 digits), `KOTAK_CLIENT_CODE`, `KOTAK_MPIN` and `KOTAK_TOTP_SECRET` (the base32 secret behind the TOTP QR code). On Windows, `deploy/windows/install.ps1` asks for them with hidden input and writes them for you.
+- `.env` and any `.env.*` copy are gitignored; the Windows installer makes `.env` readable only by your user. Never put the values in chat, email, git or docs.
+- If old values were ever shared, regenerate the consumer key and the TOTP secret in Kotak Neo and use the new ones.
+- Docker Compose reads the login from `.env` only; host environment variables are not passed through, so a stale one cannot override it. A run without Docker also reads `.env`, but a process environment variable wins there.
+- In a cloud session, add them in the environment settings instead.
 
 ## Credentialed test
 Keep `LIVE_TRADING=false` and run:
@@ -112,5 +130,7 @@ The script is read-only. It does not place, modify or cancel orders.
 
 ## Live-money gate
 The final gate still requires controlled live evidence: real feed, real instrument master, broker reconciliation, margin evidence, small-size order acknowledgement, fill/rejection/cancel lifecycle, emergency exit, kill-switch test, recovery test and operator sign-off.
+
+With live order routing, orders also need this machine's public IP to equal `REGISTERED_STATIC_IP` (Kotak accepts API orders only from the registered static IP); readiness reports `STATIC_IP_NOT_CONFIGURED` or `PUBLIC_IP_NOT_REGISTERED` otherwise.
 
 `scripts/live_gate.py` runs the automatable parts (preflight, one tiny resting buy plus cancel, kill-switch and reject paths, restart recovery) and writes an evidence report. See `scripts/CONTROLLED_LIVE_TEST.md`. Working orders can be cancelled one at a time from the Orders tab or with `POST /orders/{client_order_id}/cancel` (operator token, audited).

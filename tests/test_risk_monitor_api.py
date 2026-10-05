@@ -88,10 +88,13 @@ def test_emergency_stop_kill_survives_restart_and_needs_reset(tmp_path, make_ter
         assert [r['action'] for r in Ledger(url).audit_records()][-2:] == ['EMERGENCY_STOP', 'KILL_SWITCH_RESET']
 
 
-def test_tick_injection_blocked_in_live(make_terminal, live):
+@pytest.mark.parametrize('live_mode', [False, True])
+def test_no_http_tick_injection_in_any_mode(make_terminal, settings_override, live_mode):
+    # Ticks come only from authenticated broker streams: there is no endpoint that accepts prices.
+    settings_override(live_trading=live_mode)
     t, _ = make_terminal()
     r = client(t).post('/market/tick', json=make_tick().model_dump())
-    assert r.status_code == 403
+    assert r.status_code in (404, 405) and t.feed.stats()['accepted'] == 0
 
 
 def test_option_chain_populated_from_enriched_ticks(make_terminal):
@@ -104,13 +107,21 @@ def test_option_chain_populated_from_enriched_ticks(make_terminal):
     assert body['summary']['rows'] == 2
 
 
-def test_calculator_endpoints(make_terminal):
+@pytest.mark.parametrize('method,path', [
+    ('post', '/algo/iceberg'), ('post', '/algo/twap'), ('post', '/hedge/delta'), ('post', '/risk/scenarios'),
+    ('post', '/risk/scenarios/full'), ('post', '/risk/portfolio-greeks'), ('post', '/risk/pretrade-portfolio'),
+    ('post', '/risk/self-trade-check'), ('post', '/analytics/vol-surface'), ('post', '/analytics/tca'),
+    ('post', '/ops/ha-readiness'), ('get', '/enterprise/readiness'), ('post', '/enterprise/compliance-check'),
+    ('post', '/enterprise/dr-failover'), ('post', '/enterprise/audit'), ('post', '/decision'), ('post', '/instruments/load/ANGEL')])
+def test_no_endpoint_computes_on_made_up_inputs(make_terminal, method, path):
+    # Only live broker and market data reach the terminal: calculators on hypothetical payloads are gone.
     t, _ = make_terminal()
-    c = client(t)
-    assert c.post('/algo/iceberg', json={'qty': 10, 'disclosed': 3}).json()['children'] == [3, 3, 3, 1]
-    assert c.post('/hedge/delta', json={'net_delta': 100, 'hedge_delta': 1, 'lot_size': 25}).json()['ok']
-    assert c.post('/risk/scenarios/full', json={'positions': [], 'spots': {}}).json()['ok'] is True
-    assert c.get('/enterprise/audit/verify').json()['ok']
+    assert getattr(client(t), method)(path, **({'json': {}} if method == 'post' else {})).status_code in (404, 405)
+
+
+def test_audit_chain_verification_stays(make_terminal):
+    t, _ = make_terminal()
+    assert client(t).get('/enterprise/audit/verify').json()['ok']
 
 
 def test_paper_mode_never_reaches_a_broker(make_terminal):

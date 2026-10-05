@@ -92,12 +92,13 @@ def test_spreads_and_iron_fly(make_terminal):
     assert get(c, exp, 'iron_condor', wing=20, delta=0.05).status_code == 422  # wing past the listed strikes
 
 
-def test_analyze_custom_legs_by_token_and_price_override(make_terminal):
+def test_analyze_custom_legs_by_token_always_at_live_quotes(make_terminal):
     c, exp = setup(make_terminal)
     body = {'exchange': 'NFO', 'underlying': 'NIFTY', 'expiry': exp,
             'legs': [{'side': 'SELL', 'token': 'CE25500', 'lots': 1}, {'side': 'BUY', 'strike': 25700, 'option_type': 'CE', 'price': 12.5}]}
     r = c.post('/strategy/analyze', json=body).json()
-    assert r['legs'][0]['strike'] == 25500.0 and r['legs'][1]['price'] == 12.5 and r['stats']['max_loss'] < 0
+    # A caller-supplied price is ignored: the buy leg is priced at its live ask, never at a made-up 12.5.
+    assert r['legs'][0]['strike'] == 25500.0 and r['legs'][1]['price'] == r['legs'][1]['ask'] != 12.5 and r['stats']['max_loss'] < 0
     bad = c.post('/strategy/analyze', json={**body, 'legs': [{'side': 'SELL', 'strike': 99999, 'option_type': 'CE'}]})
     assert bad.status_code == 422 and 'NOT_IN_CHAIN' in bad.json()['reason']
     assert c.post('/strategy/analyze', json={**body, 'legs': []}).status_code == 422

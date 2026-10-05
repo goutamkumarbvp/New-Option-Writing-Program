@@ -186,7 +186,7 @@ def test_worker_connect_subscribes_static_and_dynamic_together():
             return False
 
     async def session():
-        return SimpleNamespace(create_websocket=lambda: Conn())
+        return SimpleNamespace(create_websocket=lambda **kw: Conn())
 
     async def consume(*a):
         assert w.ws is ws

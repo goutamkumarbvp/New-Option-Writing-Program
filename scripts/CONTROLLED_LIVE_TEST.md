@@ -31,7 +31,7 @@ This test is intentionally separate from automated credential checks. **Do not e
 ## Guided runner: `scripts/live_gate.py`
 The runner automates the parts of Gates A-C that can be automated, against a running terminal. Evidence goes to `reports/live_gate_<date>.json`, which is gitignored; attach it to the signed record.
 
-Run it from the machine whose static IP is registered with the broker, during market hours. The terminal must run through `docker compose` (Postgres and Redis) with `LIVE_TRADING=true` and `LIVE_PRODUCTION_ACK=I_UNDERSTAND_REAL_ORDERS`. Kotak credentials go in environment variables, and `OPERATOR_API_TOKEN` must be available to the script.
+Run it from the machine whose static IP is registered with the broker, during market hours. The terminal must run through `docker compose` (Postgres and Redis) with `LIVE_TRADING=true` and `LIVE_PRODUCTION_ACK=I_UNDERSTAND_REAL_ORDERS`. The Kotak login goes in section 1 of `.env` on that machine, `REGISTERED_STATIC_IP` must be set to its registered public IP, and `OPERATOR_API_TOKEN` must be available to the script.
 
 1. `python scripts/live_gate.py preflight --broker KOTAK --token <liquid option token>`: Gate A. It reconciles, checks readiness, auth, feed, instrument master, kill switch, risk snapshot, session and contract quote, and lists the manual confirmations.
 2. `python scripts/live_gate.py order-cancel --broker KOTAK --token <token> --i-understand-real-orders`: Gate B. It sends ONE buy of ONE lot as a LIMIT below the bid but inside the price collar, after you type the contract symbol. It waits for the broker acknowledgement, cancels with `POST /orders/{id}/cancel`, waits for CANCELLED and reconciles. It refuses above `--max-premium` (Rs 2,000 by default) and never sells.
