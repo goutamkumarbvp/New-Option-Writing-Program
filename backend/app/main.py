@@ -451,8 +451,9 @@ def create_app(t: Terminal, run_background=True):
         before = b.login_state()
         after = b.reset_login()
         t.health.at = 0.0  # next health read reflects the reset instead of the cached halt
-        if t.stream_manager:  # a feed waiting on the halted login retries now
-            t.stream_manager.request_reconnect(b.name, reason='LOGIN_RESET')
+        w = t.stream_manager.get(b.name) if t.stream_manager else None
+        if w is not None:  # a feed waiting on the halted login retries now; a streaming feed is never cut
+            w.wake_if_waiting('LOGIN_RESET')
         t.ledger.event('BROKER_LOGIN_RESET', {'broker': b.name, 'before': before})
         t.audit.append('BROKER_LOGIN_RESET', 'OPERATOR', {'broker': b.name, 'was_halted': before['halted']})
         return {'status': 'RESET', 'broker': b.name, 'before': before, 'login': after}
@@ -525,7 +526,15 @@ def create_app(t: Terminal, run_background=True):
     async def ops_doctor():
         """Machine and login diagnostics: clock, Kotak reachability, static IP, credential format
         (never values), database, Redis, instrument master, login and feed. Read-only."""
-        return await run_doctor(t, public_ip=t.readiness.public_ip)
+        return await run_doctor(t)
+
+    @app.post('/ops/doctor/login')
+    async def ops_doctor_login(x_iort_operator_token: Optional[str] = Header(default=None)):
+        """Diagnostics plus one real Kotak login through the running terminal, so its login halt, backoff,
+        TOTP-window tracking and re-login budget all apply (a separate process would bypass them)."""
+        if not require_control_operator(x_iort_operator_token):
+            return denied()
+        return await run_doctor(t, login=True)
 
     @app.get('/metrics')
     async def prometheus_metrics():

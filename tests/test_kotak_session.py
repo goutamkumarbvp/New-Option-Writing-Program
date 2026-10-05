@@ -138,7 +138,7 @@ def test_plain_errors_keep_the_session_until_three_in_a_row(settings_override):
 def test_a_session_from_an_earlier_day_is_replaced(settings_override):
     rig = Rig(settings_override, calls={'positions': [POSITIONS]})
     rig.run(rig.k.raw_positions())
-    rig.k._session_day = '2000-01-01'
+    rig.k._session_at -= 3 * 86400  # created before the latest weekday pre-open login (08:50 IST)
     rig.run(rig.k.raw_positions())
     assert len(rig.clients) == 2 and rig.k.login_state()['relogins'] == 1
 
@@ -239,16 +239,45 @@ def test_prelogin_runs_on_weekdays_after_the_configured_time(settings_override):
 
 
 # ------------------------------------------------------------------ orders
-def test_place_on_a_dead_session_is_not_sent_and_drops_the_session(settings_override):
-    rig = Rig(settings_override, calls={'place_order': [ApiErr(401)]}, live_trading=True)
-    o = {'exchange': 'nse_fo', 'product': 'NRML', 'price': 10.0, 'order_type': 'LIMIT', 'qty': 75, 'symbol': 'NIFTY',
+ORDER = {'exchange': 'nse_fo', 'product': 'NRML', 'price': 10.0, 'order_type': 'LIMIT', 'qty': 75, 'symbol': 'NIFTY',
          'side': 'BUY', 'trigger_price': 0, 'client_order_id': 'C-1'}
+
+
+def test_place_on_a_dead_session_is_not_sent_and_drops_the_session(settings_override):
+    rig = Rig(settings_override, calls={'place_order': [ApiErr(401)], 'positions': [POSITIONS]}, live_trading=True)
+    o = ORDER
+    rig.run(rig.k.raw_positions())  # logged in by the monitors, as in the running terminal
     r = rig.run(rig.k.place(o))
     assert r == {'status': 'REJECTED', 'reason': 'NOT_SENT:KOTAK_SESSION', 'broker': 'KOTAK'}
     assert rig.k.login_state()['session_expired']
+    rig.run(rig.k.raw_positions())
     rig.calls['place_order'] = [{'Error': 'Invalid JWT token'}]
     r = rig.run(rig.k.place(o))
     assert r['status'] == 'UNKNOWN' and rig.k.login_state()['session_expired']  # ambiguous text: never called REJECTED
+
+
+def test_place_never_logs_in_and_never_waits_for_a_login(settings_override):
+    rig = Rig(settings_override, calls={'place_order': [{'stat': 'Ok', 'nOrdNo': '1'}]}, live_trading=True)
+    assert rig.run(rig.k.place(ORDER)) == {'status': 'REJECTED', 'reason': 'NOT_SENT:KOTAK_NOT_LOGGED_IN', 'broker': 'KOTAK'}
+    assert not rig.clients  # nothing logged in from the order path
+
+
+@pytest.mark.parametrize('reply,status', [
+    ({'stat': 'Ok', 'nOrdNo': '2601010001'}, 'SUBMITTED'),
+    ({'stat': 'Not_Ok', 'emsg': 'RMS: margin exceeds', 'stCode': 1006}, 'REJECTED'),
+    ({'fault': {'code': 101504, 'message': 'Runtime Error', 'description': 'Send timeout'}}, 'UNKNOWN'),
+    ({'error': [{'code': '500', 'message': 'Internal Server Error'}]}, 'UNKNOWN'),
+    ({'error': [{'code': '504', 'message': 'Gateway Timeout'}]}, 'UNKNOWN'),
+    ({'errors': [{'code': '502', 'message': 'Bad Gateway'}]}, 'UNKNOWN'),
+    ({'error': 'HTTPSConnectionPool: Read timed out'}, 'UNKNOWN'),
+    ({'stat': 'Not_Ok', 'emsg': 'Gateway timeout'}, 'UNKNOWN'),
+    ({'unexpected': True}, 'UNKNOWN'),
+])
+def test_order_replies_that_may_be_live_are_unknown(settings_override, reply, status):
+    # REJECTED only for a well-formed refusal; anything that may have reached Kotak blocks until reconciled.
+    rig = Rig(settings_override, calls={'place_order': [reply], 'positions': [POSITIONS]}, live_trading=True)
+    rig.run(rig.k.raw_positions())
+    assert rig.run(rig.k.place(ORDER))['status'] == status
 
 
 def test_aclose_scrubs_the_session(settings_override):
@@ -390,3 +419,123 @@ def test_health_names_the_kind_of_login_problem(settings_override):
         rig2.run(rig2.k.session())
     h = rig2.run(rig2.k.health())
     assert h['status'] == 'CONFIG_ERROR' and 'KOTAK_MOBILE' in h['error'] and '12345' not in h['error']
+
+
+# ------------------------------------------------------------------ review regressions (3.3.1)
+@pytest.mark.parametrize('resp', [
+    {'error': [{'code': '401', 'message': 'Invalid MPIN. Account locked after too many incorrect attempts'}]},
+    {'error': [{'code': '424', 'message': 'Too many invalid TOTP attempts, please try again later'}]},
+    {'stat': 'Not_Ok', 'emsg': 'User blocked: too many wrong MPIN attempts'},
+    {'error': [{'code': '401', 'message': 'A valid TOTP is required'}]},
+])
+def test_lockout_and_refusal_wording_always_counts(resp):
+    assert login_reply_kind(resp) == 'REJECTED'
+
+
+def test_a_locked_account_halts_instead_of_retrying_forever(settings_override):
+    rig = Rig(settings_override, kotak_login_max_rejections=2)
+    locked = {'error': [{'code': '401', 'message': 'Account locked after too many incorrect attempts'}]}
+
+    class Locked:
+        def __init__(self, consumer_key, environment):
+            rig.clients.append(self)
+
+        def totp_login(self, **kw):
+            return locked
+    rig.k._factory = Locked
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            rig.run(rig.k.session())
+        rig.mono[0] += 10 ** 4
+    assert rig.k.login_state()['halted'] and len(rig.clients) == 2
+
+
+def test_a_refused_one_time_code_is_never_resent(settings_override):
+    rig = Rig(settings_override, logins=['reject_totp', 'ok'], kotak_totp='123456', kotak_totp_secret='')
+    with pytest.raises(RuntimeError, match='KOTAK_LOGIN_REJECTED'):
+        rig.run(rig.k.session())
+    rig.mono[0] += 60
+    with pytest.raises(RuntimeError, match='KOTAK_TOTP_SECRET_REQUIRED'):
+        rig.run(rig.k.session())
+    rig.k.reset_login()
+    with pytest.raises(RuntimeError, match='KOTAK_TOTP_SECRET_REQUIRED'):
+        rig.run(rig.k.session())
+    assert [c for c, _ in rig.codes] == ['123456']  # sent exactly once
+
+
+def test_one_time_code_blocked_at_connect_was_never_sent(settings_override):
+    rig = Rig(settings_override, logins=[ApiErr(0), 'ok'], kotak_totp='123456', kotak_totp_secret='',
+              kotak_login_transport_backoff_max_sec=1)
+    with pytest.raises(RuntimeError, match='KOTAK_LOGIN_TRANSPORT'):
+        rig.run(rig.k.session())
+    rig.mono[0] += 5
+    assert rig.run(rig.k.session()) is not None  # the proxy refused the tunnel: the code is still unused
+
+
+def test_clock_is_measured_before_every_login_and_reset_forgets_it(settings_override):
+    from app.totp import totp
+    rig = Rig(settings_override, calls={'positions': [lambda c: FAULT if c.n == 1 else POSITIONS]})
+    rig.probe_result = 42.0
+    rig.run(rig.k.session())
+    rig.probe_result = 0.4  # the operator fixed the clock
+    rig.run(rig.k.raw_positions())  # the session expires and a new login follows
+    (_, _), (code2, _) = rig.codes
+    assert code2 == totp('JBSWY3DPEHPK3PXP', at=rig.wall[0]) and rig.k.login_state()['clock_offset_sec'] == 0.4
+    rig.k.reset_login()
+    assert rig.k._offset_at == 0.0 and rig.k.login_state()['clock_offset_sec'] is None
+
+
+def test_forced_relogins_and_silent_expiries_respect_the_budget(settings_override):
+    rig = Rig(settings_override, calls={'positions': [POSITIONS], 'trade_report': [{'Error': 'Read timed out'}]},
+              kotak_relogin_budget=1, kotak_relogin_after_errors=1)
+    first = rig.run(rig.k.session())
+    second = rig.run(rig.k.session(force=True))  # budget 1: allowed once
+    assert second is not first
+    assert rig.run(rig.k.session(force=True)) is second  # budget spent: the working session is kept
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match='KOTAK_TRADE_REPORT_ERROR'):
+            rig.run(rig.k.raw_trades())
+    assert rig.k.peek_session() is second and len(rig.clients) == 2  # no silent-expiry login storm
+
+
+def test_a_likely_auth_reply_on_the_probe_never_drops_the_session(settings_override):
+    rig = Rig(settings_override, calls={'positions': [POSITIONS], 'limits': [{'stat': 'Not_Ok', 'emsg': 'Invalid session for segment'}]})
+    rig.run(rig.k.raw_positions())
+    s = rig.k.peek_session()
+    rig.wall[0] += 31
+    assert rig.run(rig.k.health())['status'] == 'AUTH_ERROR' and rig.k.peek_session() is s
+
+
+def test_a_slow_failure_on_an_old_session_keeps_the_new_one(settings_override):
+    rig = Rig(settings_override, calls={'positions': [POSITIONS]})
+    old = rig.run(rig.k.session())
+    new = rig.run(rig.k.session(force=True))
+    assert rig.k._expire_session('late failure on the old client', old) is False
+    assert rig.k.peek_session() is new
+
+
+def test_the_trading_day_starts_at_the_pre_open_login_not_midnight(settings_override):
+    from app.brokers import session_boundary
+    settings_override(kotak_prelogin_ist='08:50')
+    tue_0001 = datetime(2026, 10, 6, 0, 1, tzinfo=IST).timestamp()
+    mon_0900 = datetime(2026, 10, 5, 9, 0, tzinfo=IST).timestamp()
+    fri_0900 = datetime(2026, 10, 2, 9, 0, tzinfo=IST).timestamp()
+    assert session_boundary(tue_0001) == datetime(2026, 10, 5, 8, 50, tzinfo=IST).timestamp()  # Monday's pre-open
+    assert session_boundary(datetime(2026, 10, 4, 12, 0, tzinfo=IST).timestamp()) == datetime(2026, 10, 2, 8, 50, tzinfo=IST).timestamp()
+    rig = Rig(settings_override)
+    rig.wall[0] = mon_0900
+    rig.run(rig.k.session())
+    rig.wall[0] = tue_0001
+    assert rig.k._fresh()  # no midnight re-login
+    rig.wall[0] = datetime(2026, 10, 6, 8, 50, tzinfo=IST).timestamp()
+    assert not rig.k._fresh()  # Tuesday's pre-open replaces Monday's session
+    rig.k._session_at, rig.wall[0] = fri_0900, datetime(2026, 10, 5, 8, 0, tzinfo=IST).timestamp()
+    assert rig.k._fresh()  # Friday's session lasts the weekend until Monday's pre-open
+
+
+def test_the_window_recorded_is_the_window_of_the_code_sent(settings_override):
+    from app.totp import totp
+    rig = Rig(settings_override)
+    rig.run(rig.k.session())
+    code, step = rig.codes[0]
+    assert rig.k._last_totp_step == step and code == totp('JBSWY3DPEHPK3PXP', at=step * 30 + 1)

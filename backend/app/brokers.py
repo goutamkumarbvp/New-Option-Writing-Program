@@ -13,10 +13,11 @@ import asyncio
 import hashlib
 import re
 import time
+from datetime import datetime, timedelta
 
 import httpx
 
-from .clock import IST, now_ist, trading_date
+from .clock import IST, now_ist
 from .clockcheck import clock_hint, clock_offset
 from .config import settings
 from .normalize import (EvidenceUnavailable, WORKING, normalize_margin, normalize_orders,
@@ -84,11 +85,20 @@ def login_reply_kind(resp):
     if not isinstance(resp, dict):
         return 'TRANSPORT'
     codes, text = _reply_parts(resp)
-    if _CONFIG_TEXT.search(text):
-        return 'CONFIG'
-    if any(c == 0 or c >= 500 or c in (408, 429) for c in codes if c < 1000) or _TRANSPORT_TEXT.search(text):
+    http = [c for c in codes if c < 1000]
+    # A refusal code or lockout wording wins over everything else: "account locked after too many
+    # attempts" must count toward the halt, never be retried as if it were a network error.
+    if any(400 <= c < 500 and c not in (408, 429) for c in http) or _LOCK_TEXT.search(text):
+        return 'REJECTED'
+    if any(c == 0 or c >= 500 or c in (408, 429) for c in http) or _TRANSPORT_TEXT.search(text):
         return 'TRANSPORT'
+    if not http and _CONFIG_TEXT.search(text):
+        return 'CONFIG'
     return 'REJECTED'
+
+
+UCC_RE = re.compile(r'[A-Za-z0-9]{3,15}')
+MPIN_RE = re.compile(r'\d{4,6}')
 
 
 def kotak_mobile(value):
@@ -108,10 +118,10 @@ def kotak_login_fields():
     if not mobile:
         raise RuntimeError('KOTAK_CONFIG_INVALID:KOTAK_MOBILE:write +91 followed by the 10-digit number')
     ucc = str(settings.kotak_client_code or '').strip()
-    if not re.fullmatch(r'[A-Za-z0-9]{3,15}', ucc):
+    if not UCC_RE.fullmatch(ucc):
         raise RuntimeError('KOTAK_CONFIG_INVALID:KOTAK_CLIENT_CODE:letters and digits only')
     mpin = str(settings.kotak_mpin or '').strip()
-    if not re.fullmatch(r'\d{4,6}', mpin):
+    if not MPIN_RE.fullmatch(mpin):
         raise RuntimeError('KOTAK_CONFIG_INVALID:KOTAK_MPIN:digits only (the 6-digit MPIN)')
     return mobile, ucc, mpin
 
@@ -142,6 +152,24 @@ _AUTH_TEXT = re.compile(r'session (has )?expired|invalid session|session.{0,20}(
 _TRANSPORT_TEXT = re.compile(r'unexpected response|gateway|unavailable|maintenance|timed? ?out|timeout|try again later|too many|'
                              r'rate limit|server error|internal error|connection|unable to connect', re.I)
 _CONFIG_TEXT = re.compile(r'missing required|required field|is required|must be (a|an|provided)', re.I)
+_LOCK_TEXT = re.compile(r'locked|blocked|too many (invalid|incorrect|wrong|failed|unsuccessful)|attempts? (exceeded|remaining)|exceeded', re.I)
+
+
+def session_boundary(wall_ts):
+    """Epoch seconds of the most recent weekday KOTAK_PRELOGIN_IST instant at or before wall_ts (midnight
+    IST when the pre-open login is off). A Kotak session created before it belongs to an earlier trading
+    day: the day starts at the pre-open login, not at midnight, so no login happens at 00:00 or at weekends."""
+    now = datetime.fromtimestamp(wall_ts, tz=IST)
+    try:
+        hh, mm = (int(x) for x in str(settings.kotak_prelogin_ist).split(':'))
+    except ValueError:
+        hh, mm = 0, 0
+    b = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if b > now:
+        b -= timedelta(days=1)
+    while b.weekday() >= 5:
+        b -= timedelta(days=1)
+    return b.timestamp()
 AUTH_PROVEN = 'PROVEN'   # the gateway or the SDK refused before processing: the request was not executed
 AUTH_LIKELY = 'LIKELY'   # an error message reads like a dead session; the request may have been processed
 
@@ -462,7 +490,6 @@ class Kotak(BaseBroker):
         super().__init__(transport)
         self._session = None
         self._session_at = 0.0
-        self._session_day = None    # IST trading date the session was created on
         self._lock = asyncio.Lock()
         self._factory = client_factory  # tests inject a fake NeoAPI; production imports the SDK lazily
         self._clock = clock or time.monotonic
@@ -496,9 +523,6 @@ class Kotak(BaseBroker):
         off = self._clock_offset
         return self._wall() + (off if off is not None and abs(off) >= 3 else 0.0)
 
-    def _code(self):
-        return totp(settings.kotak_totp_secret, at=self._now_kotak()) if settings.kotak_totp_secret else settings.kotak_totp
-
     # ------------------------------------------------------------- login backoff
     # The risk monitor, order monitor, reconciler, health check and stream worker all
     # call session(). Without backoff a failing login was retried about once a second,
@@ -518,28 +542,34 @@ class Kotak(BaseBroker):
         """Operator action: clear the halt and backoff so the next call logs in immediately."""
         self._failures = self._rejections = 0
         self._retry_at, self._halted, self._last_error = 0.0, False, None
-        self._clock_offset = None
+        self._clock_offset, self._offset_at = None, 0.0  # the next login measures the clock first
         return self.login_state()
 
     def peek_session(self):
         """The cached client, or None. Never logs in: callers use it to notice a replaced session."""
         return self._session
 
-    def _expire_session(self, why):
-        """Drop a session found dead. The next session() call logs in again, subject to the backoff and halt."""
+    def _expire_session(self, why, c=None):
+        """Drop a session found dead. The next session() call logs in again, subject to the backoff and halt.
+        With `c`, only that client is dropped: a slow call that fails on an old session must never throw
+        away the newer session another caller already logged in."""
+        if c is not None and self._session is not c:
+            return False
         if self._session is not None:
             self._expired = True
         self._session = None
         self._last_error = f'SESSION_EXPIRED:{why}'[:200]
+        return True
 
     def _mark_ok(self):
         self._last_ok_at = self._wall()
         self._bad_calls = 0
 
     def _fresh(self):
-        """A usable session: present, within the TTL, and created on today's IST trading date."""
-        return bool(self._session and self._wall() - self._session_at < settings.kotak_session_ttl_sec
-                    and self._session_day == trading_date())
+        """A usable session: present, created since the latest pre-open boundary, and within the TTL backstop."""
+        now = self._wall()
+        return bool(self._session and self._session_at >= session_boundary(now)
+                    and now - self._session_at < settings.kotak_session_ttl_sec)
 
     def _login_failed(self, kind, detail):
         self._failures += 1
@@ -577,9 +607,10 @@ class Kotak(BaseBroker):
             off = await asyncio.wait_for(self._clock_probe(), 6)
         except Exception:  # noqa: BLE001
             off = None
-        self._offset_at = self._wall()
         if off is not None:
-            self._clock_offset = off
+            self._clock_offset, self._offset_at = off, self._wall()
+        elif self._offset_at and self._wall() - self._offset_at > 3600:
+            self._clock_offset = None  # too old to trust (the operator may have fixed the clock since)
         return off
 
     async def _after_rejection(self):
@@ -608,6 +639,8 @@ class Kotak(BaseBroker):
                 return await asyncio.shield(self._login_task)
             if self._fresh() and not force:
                 return self._session
+            if self._fresh() and force and not self._relogin_allowed():
+                return self._session  # re-login budget spent: keep the working session rather than log in again
             if not self.configured():
                 raise RuntimeError('KOTAK_CREDENTIALS_MISSING')
             if settings.kotak_totp_secret and not totp_secret_valid(settings.kotak_totp_secret):
@@ -633,10 +666,6 @@ class Kotak(BaseBroker):
 
     async def _login(self, mobile, ucc, mpin):
         if True:  # keeps the original indentation of the login body
-            if settings.kotak_totp_secret:
-                if not self._offset_at or self._wall() - self._offset_at > 6 * 3600:
-                    await self._measure_clock()
-                await self._totp_pause()
             factory = self._factory
             if factory is None:
                 from neo_api_client import NeoAPI as factory
@@ -644,15 +673,25 @@ class Kotak(BaseBroker):
                 c = factory(consumer_key=settings.kotak_api_key, environment='prod')
             except Exception as exc:  # noqa: BLE001 - SDK construction failed; nothing reached Kotak's auth
                 raise self._login_failed('TRANSPORT', type(exc).__name__) from exc
-            for name, step in (('TOTP', lambda: c.totp_login(mobile_number=mobile, ucc=ucc, totp=self._code())),
+            secret = settings.kotak_totp_secret
+            if secret:
+                await self._measure_clock()  # every login: a stale offset would make the code a certain refusal
+                await self._totp_pause()
+            # The code is computed here, on one timestamp, so the window recorded is the window sent.
+            at = self._now_kotak()
+            code = totp(secret, at=at) if secret else settings.kotak_totp
+            self._last_totp_step = int(at // 30)
+            if not secret:
+                self._static_totp_used = True  # a one-time code is spent the moment it is sent, whatever the reply
+            for name, step in (('TOTP', lambda: c.totp_login(mobile_number=mobile, ucc=ucc, totp=code)),
                                ('MPIN', lambda: c.totp_validate(mpin=mpin))):
-                if name == 'TOTP':
-                    self._last_totp_step = int(self._now_kotak() // 30)
                 try:
                     resp = await asyncio.wait_for(asyncio.to_thread(step), settings.kotak_login_step_timeout_sec)
                 except asyncio.TimeoutError as exc:
                     raise self._login_failed('TRANSPORT', f'{name}:TIMEOUT') from exc
                 except Exception as exc:  # noqa: BLE001
+                    if name == 'TOTP' and not secret and getattr(exc, 'status', None) == 0:
+                        self._static_totp_used = False  # refused at connect (proxy, no network): the code never left
                     kind = login_failure_kind(exc)
                     err = self._login_failed(kind, f'{name}:{type(exc).__name__}:{str(exc)[:80]}')
                     if kind == 'REJECTED':
@@ -665,12 +704,10 @@ class Kotak(BaseBroker):
                         await self._after_rejection()
                     raise err
             had_session = self._session is not None or self._expired
-            self._session, self._session_at, self._session_day = c, self._wall(), trading_date()
+            self._session, self._session_at = c, self._wall()
             self._failures = self._rejections = 0
             self._retry_at, self._last_error = 0.0, None
             self._expired, self._bad_calls = False, 0
-            if not settings.kotak_totp_secret:
-                self._static_totp_used = True
             if had_session:
                 self._relogins += 1
             return c
@@ -688,27 +725,29 @@ class Kotak(BaseBroker):
                 resp = await asyncio.to_thread(getattr(c, fn_name), **kw)
             except Exception as exc:  # noqa: BLE001
                 if kotak_auth_failure(exc):
-                    if not self._relogin_allowed():
-                        raise RuntimeError(f'{label}_AUTH_ERROR:RELOGIN_BUDGET_EXHAUSTED') from exc
-                    self._expire_session(f'{fn_name}:{type(exc).__name__}')
+                    if self._session is c:  # not already replaced by another caller
+                        if not self._relogin_allowed():
+                            raise RuntimeError(f'{label}_AUTH_ERROR:RELOGIN_BUDGET_EXHAUSTED') from exc
+                        self._expire_session(f'{fn_name}:{type(exc).__name__}', c)
                     if attempt == 1:
                         continue
                     raise RuntimeError(f'{label}_AUTH_ERROR') from exc
-                self._note_bad_call()
+                self._note_bad_call(c)
                 raise
             auth = kotak_auth_failure(resp)
             if auth == AUTH_LIKELY and attempt == 2:
-                self._note_bad_call()  # still 'likely' right after a fresh login: an ordinary error, not a second expiry
+                self._note_bad_call(c)  # still 'likely' right after a fresh login: an ordinary error, not a second expiry
                 raise RuntimeError(f'{label}_ERROR')
             if auth:
-                if not self._relogin_allowed():
-                    raise RuntimeError(f'{label}_AUTH_ERROR:RELOGIN_BUDGET_EXHAUSTED')
-                self._expire_session(f'{fn_name}:{auth}')
+                if self._session is c:  # not already replaced by another caller
+                    if not self._relogin_allowed():
+                        raise RuntimeError(f'{label}_AUTH_ERROR:RELOGIN_BUDGET_EXHAUSTED')
+                    self._expire_session(f'{fn_name}:{auth}', c)
                 if attempt == 1:
                     continue
                 raise RuntimeError(f'{label}_AUTH_ERROR')
             if isinstance(resp, dict) and ('Error' in resp or 'Error Message' in resp or 'error' in resp):
-                self._note_bad_call()
+                self._note_bad_call(c)
                 raise RuntimeError(f'{label}_ERROR')
             self._mark_ok()
             return resp
@@ -724,11 +763,14 @@ class Kotak(BaseBroker):
         self._relogin_times.append(now)
         return True
 
-    def _note_bad_call(self):
+    def _note_bad_call(self, c=None):
+        if c is not None and self._session is not c:
+            return  # an error on a session that has already been replaced says nothing about the new one
         self._bad_calls += 1
         if self._bad_calls >= max(1, settings.kotak_relogin_after_errors):
-            self._expire_session(f'{self._bad_calls}_CONSECUTIVE_ERRORS')
-            self._bad_calls = 0
+            n, self._bad_calls = self._bad_calls, 0
+            if self._relogin_allowed():  # a silent expiry is still bound by the re-login budget
+                self._expire_session(f'{n}_CONSECUTIVE_ERRORS', c)
 
     async def health(self):
         """LIVE only when an authenticated call has actually succeeded recently. A cached session
@@ -768,14 +810,16 @@ class Kotak(BaseBroker):
         except asyncio.TimeoutError as exc:
             raise RuntimeError('KOTAK_PROBE_TIMEOUT') from exc
         except Exception as exc:  # noqa: BLE001
-            if kotak_auth_failure(exc):
-                self._expire_session(f'limits:{type(exc).__name__}')
+            if kotak_auth_failure(exc) and self._session is c and self._relogin_allowed():
+                self._expire_session(f'limits:{type(exc).__name__}', c)
                 raise RuntimeError('KOTAK_SESSION_EXPIRED') from exc
             raise
         auth = kotak_auth_failure(resp)
-        if auth:
-            self._expire_session(f'limits:{auth}')
+        if auth == AUTH_PROVEN and self._session is c and self._relogin_allowed():
+            self._expire_session(f'limits:{auth}', c)
             raise RuntimeError('KOTAK_SESSION_EXPIRED')
+        if auth:
+            raise RuntimeError('KOTAK_LIMITS_ERROR')  # only 'likely' (or budget spent): never drop a session on a guess
         if isinstance(resp, dict) and ('Error' in resp or 'error' in resp):
             raise RuntimeError('KOTAK_LIMITS_ERROR')
         self._mark_ok()
@@ -839,10 +883,11 @@ class Kotak(BaseBroker):
     async def place(self, o):
         if not settings.live_trading:
             return {'status': 'REJECTED', 'reason': 'LIVE_TRADING_DISABLED', 'broker': self.name}
-        try:
-            c = await self.session()
-        except Exception as exc:  # noqa: BLE001 - login failed, nothing was sent
-            return {'status': 'REJECTED', 'reason': 'NOT_SENT:' + str(exc)[:80], 'broker': self.name}
+        # Never log in from here: a login can take most of a minute, and the pre-trade checks (fresh quote,
+        # kill switch, price band) were made just before this call. The monitors and the pre-open task log in.
+        c = self._session
+        if c is None or not self._fresh() or self._logging_in():
+            return {'status': 'REJECTED', 'reason': 'NOT_SENT:KOTAK_NOT_LOGGED_IN', 'broker': self.name}
         kw = dict(exchange_segment=o['exchange'], product=o['product'], price=str(o.get('price') or 0),
                   order_type=self.ORDER_TYPE[o['order_type']], quantity=str(o['qty']), validity='DAY',
                   trading_symbol=o['symbol'], transaction_type='B' if o['side'] == 'BUY' else 'S',
@@ -851,7 +896,7 @@ class Kotak(BaseBroker):
             resp = await asyncio.to_thread(c.place_order, **kw)
         except Exception as exc:  # noqa: BLE001
             if kotak_auth_failure(exc):  # HTTP 401/403: the gateway refused before any processing
-                self._expire_session(f'place_order:{type(exc).__name__}')
+                self._expire_session(f'place_order:{type(exc).__name__}', c)
                 return {'status': 'REJECTED', 'reason': 'NOT_SENT:KOTAK_SESSION', 'broker': self.name}
             return {'status': 'UNKNOWN', 'reason': 'AMBIGUOUS:' + type(exc).__name__, 'broker': self.name}
         if not isinstance(resp, dict):
@@ -860,19 +905,22 @@ class Kotak(BaseBroker):
         if auth == AUTH_PROVEN:
             # The SDK refuses before sending when the session is not 2FA-complete, and the gateway
             # refuses an invalid token before the order reaches the OMS. Either way nothing was sent.
-            self._expire_session('place_order')
+            self._expire_session('place_order', c)
             return {'status': 'REJECTED', 'reason': 'NOT_SENT:KOTAK_SESSION', 'broker': self.name}
         if auth == AUTH_LIKELY:
-            self._expire_session('place_order:LIKELY')  # drop the session, but the outcome stays ambiguous below
-        if 'Error' in resp:
-            # The SDK wraps validation errors (not sent) and transport errors (maybe sent) in the
-            # same shape, so this is ambiguous. Reconciliation resolves it by order tag.
-            return {'status': 'UNKNOWN', 'reason': 'KOTAK_SDK_ERROR', 'broker': self.name,
-                    'response': {'error': str(resp.get('Error'))[:300]}}
+            self._expire_session('place_order:LIKELY', c)  # drop the session; the order outcome is decided below
         oid = resp.get('nOrdNo')
         if oid and str(resp.get('stat', 'Ok')).lower() == 'ok':
             return {'status': 'SUBMITTED', 'broker': self.name, 'broker_order_id': str(oid), 'response': resp}
-        return {'status': 'REJECTED', 'reason': 'BROKER_LOGICAL_REJECT', 'broker': self.name, 'response': resp}
+        codes, text = _reply_parts(resp)
+        transportish = (any(k in resp for k in ('Error', 'error', 'errors', 'fault'))
+                        or any(x == 0 or x == 408 or x >= 500 for x in codes if x < 1000) or bool(_TRANSPORT_TEXT.search(text)))
+        if str(resp.get('stat', '')).lower() == 'not_ok' and not transportish:
+            # A well-formed refusal from Kotak's order system: the order was not accepted.
+            return {'status': 'REJECTED', 'reason': 'BROKER_LOGICAL_REJECT', 'broker': self.name, 'response': resp}
+        # Anything else (gateway or server error, timeout, an SDK error wrapper, an unexpected body) may have
+        # come after the order was forwarded. UNKNOWN blocks new orders on Kotak until reconciliation finds it.
+        return {'status': 'UNKNOWN', 'reason': 'KOTAK_AMBIGUOUS_REPLY', 'broker': self.name, 'response': {'reply': str(resp)[:300]}}
 
     async def cancel(self, broker_order_id):
         try:

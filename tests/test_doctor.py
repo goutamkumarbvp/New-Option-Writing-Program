@@ -29,12 +29,16 @@ def test_credential_checks_report_format_never_values(settings_override):
     settings_override(**GOOD)
     out = credential_checks()
     assert {n: s for n, s, *_ in out} == {k: 'OK' for k in ('KOTAK_API_KEY', 'KOTAK_MOBILE', 'KOTAK_CLIENT_CODE', 'KOTAK_MPIN', 'KOTAK_TOTP_SECRET')}
-    settings_override(kotak_mobile='9876543210', kotak_mpin='12345', kotak_totp_secret='nope!', kotak_api_key='')
+    # The doctor applies the login's own rules: a 10-digit mobile without +91 is accepted (the login adds it),
+    # +91 followed by a number starting 1-5 is not, and the MPIN must be digits only.
+    settings_override(kotak_mobile='9876543210', kotak_mpin='12 34', kotak_totp_secret='nope!', kotak_api_key='')
+    assert {n: s for n, s, *_ in credential_checks()}['KOTAK_MOBILE'] == 'OK'
+    settings_override(kotak_mobile='+911234567890')
     bad = {n: (s, d) for n, s, d, _ in credential_checks()}
     assert bad['KOTAK_MOBILE'][0] == bad['KOTAK_MPIN'][0] == bad['KOTAK_TOTP_SECRET'][0] == 'FAIL'
     assert bad['KOTAK_API_KEY'] == ('FAIL', 'not set')
     text = repr(out) + repr(bad)
-    for secret in ('9876543210', '123456', 'JBSWY3DPEHPK3PXP', 'consumer-key-123', 'AB1234'):
+    for secret in ('9876543210', '1234567890', '123456', '12 34', 'JBSWY3DPEHPK3PXP', 'consumer-key-123', 'AB1234'):
         assert secret not in text  # no credential value ever appears in the report
 
 
@@ -122,3 +126,54 @@ def test_doctor_cli_help(flag, capsys):
     with pytest.raises(SystemExit):
         main([flag])
     assert '--login' in capsys.readouterr().out
+
+
+def test_static_ip_mismatch_is_never_reported_ok_when_the_gate_is_off(make_terminal, settings_override):
+    settings_override(**GOOD, registered_static_ip='198.51.100.9', require_static_ip_match=False)
+    t, _ = make_terminal()
+
+    async def probe():
+        return 0.0
+    r = asyncio.run(run_doctor(t, transport=httpx.MockTransport(kotak_up), probe_clock=probe))
+    c = {x['name']: x for x in r['checks']}['Public IP']
+    assert c['status'] == 'WARN' and 'registered is 198.51.100.9' in c['detail'] and 'not blocked' in c['detail']
+
+
+def test_cli_uses_the_running_terminal_and_never_logs_in_alone(monkeypatch, capsys):
+    import app.doctor as doc
+    monkeypatch.setattr(doc, '_from_running_terminal', lambda login: None)
+    assert doc.main(['--login']) == 2  # terminal not running: no separate-process login
+    assert 'not running' in capsys.readouterr().out
+    rep = {'ok': True, 'summary': 'OK', 'checks': [], 'took_sec': 0.1}
+    monkeypatch.setattr(doc, '_from_running_terminal', lambda login: rep)
+    assert doc.main(['--json']) == 0
+
+
+def test_cli_reports_a_database_outage_instead_of_crashing(monkeypatch, settings_override):
+    import app.doctor as doc
+    import app.main as m
+
+    def broken(*a, **k):
+        raise ConnectionError('connection refused')
+    monkeypatch.setattr(m, 'Terminal', broken)
+
+    async def no_net(t=None, **kw):
+        return {'ok': True, 'summary': 'OK', 'checks': [], 'took_sec': 0.0}
+    monkeypatch.setattr(doc, 'run_doctor', no_net)
+    r = asyncio.run(doc._local_report())
+    assert not r['ok'] and r['checks'][0]['name'] == 'Database' and r['checks'][0]['status'] == 'FAIL'
+
+
+def test_doctor_login_endpoint_needs_the_operator_token(make_terminal, monkeypatch):
+    t, _ = make_terminal()
+    seen = []
+
+    async def fake(t_, login=False, **kw):
+        seen.append(login)
+        return {'ok': True, 'summary': 'OK', 'checks': [], 'took_sec': 0.0}
+    monkeypatch.setattr('app.main.run_doctor', fake)
+    with override(operator_api_token=TOKEN):
+        c = TestClient(create_app(t, run_background=False))
+        assert c.post('/ops/doctor/login').status_code == 401
+        assert c.post('/ops/doctor/login', headers={'X-IORT-Operator-Token': TOKEN}).json()['summary'] == 'OK'
+    assert seen == [True]

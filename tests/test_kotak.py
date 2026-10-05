@@ -14,7 +14,7 @@ from app.main import create_app
 from app.models import Tick
 
 CREDS = dict(kotak_api_key='key', kotak_mobile='+919876543210', kotak_client_code='UCC', kotak_mpin='000000',
-             kotak_totp='123456', kotak_totp_secret='')
+             kotak_totp='', kotak_totp_secret='JBSWY3DPEHPK3PXP')
 
 
 class ApiErr(Exception):
@@ -52,7 +52,14 @@ def kotak(script, settings_override, **extra):
     settings_override(**CREDS, **extra)
     neo, calls = neo_factory(script)
     now = [1000.0]
-    return Kotak(client_factory=neo, clock=lambda: now[0]), calls, now
+    wall = [1_759_660_210.0]  # fixed wall clock; TOTP-window waits advance it instead of sleeping
+
+    async def sleep(sec):
+        wall[0] += sec
+
+    async def probe():
+        return None
+    return Kotak(client_factory=neo, clock=lambda: now[0], wall=lambda: wall[0], sleep=sleep, clock_probe=probe), calls, now
 
 
 def login(k, force=False):

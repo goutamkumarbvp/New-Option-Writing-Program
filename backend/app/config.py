@@ -249,7 +249,7 @@ class Settings:
     kotak_mpin: str = field(default_factory=lambda: _s('KOTAK_MPIN'))
     # A session lasts the IST trading day (it is replaced at day rollover or when Kotak ends it). The TTL is
     # only a backstop: a short one forced a midday re-login that also dropped the live feed.
-    kotak_session_ttl_sec: int = field(default_factory=lambda: _i('KOTAK_SESSION_TTL_SEC', 20 * 3600))
+    kotak_session_ttl_sec: int = field(default_factory=lambda: _i('KOTAK_SESSION_TTL_SEC', 80 * 3600))
     # Login backoff: failed logins wait base * 2^(n-1) seconds (capped) before the next attempt.
     # Credential rejections (wrong MPIN/TOTP) halt automatic login after this many in a row,
     # so the terminal cannot lock the account; an operator reset or a restart clears the halt.

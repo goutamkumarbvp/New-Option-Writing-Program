@@ -16,14 +16,16 @@ KOTAK_HOSTS = ('mis.kotaksecurities.com', 'cis.kotaksecurities.com', 'lapi.kotak
 class PublicIP:
     """This machine's public IP as seen from the internet, cached for `ttl` seconds."""
 
-    def __init__(self, ttl=300.0, transport=None, clock=time.monotonic):
-        self.ttl, self.transport, self.clock = ttl, transport, clock
+    def __init__(self, ttl=300.0, transport=None, clock=time.monotonic, fail_ttl=15.0):
+        self.ttl, self.transport, self.clock, self.fail_ttl = ttl, transport, clock, fail_ttl
         self.ip, self.at, self.error = None, 0.0, None
         self._lock = asyncio.Lock()
 
     async def get(self, force=False):
         async with self._lock:
-            if not force and self.at and self.clock() - self.at < self.ttl:
+            # A good answer is kept for `ttl`; a failed lookup only for `fail_ttl`, so one blip blocks
+            # live orders (fail-closed) for seconds, not minutes.
+            if not force and self.at and self.clock() - self.at < (self.ttl if self.ip else self.fail_ttl):
                 return self.ip
             self.at = self.clock()
             try:

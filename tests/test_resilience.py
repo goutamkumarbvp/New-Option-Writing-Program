@@ -104,3 +104,45 @@ def test_health_endpoint_does_not_wait_for_a_kotak_login(make_terminal, settings
     with override(operator_api_token=TOKEN):
         h = TestClient(create_app(t, run_background=False)).get('/health').json()
     assert h['brokers'][0]['status'] == 'NOT_LOGGED_IN'  # reported at once; no login was attempted
+
+
+def test_kill_switch_keeps_every_engage_and_reset_in_order():
+    led = FlakyLedger()
+    k = KillSwitch(led)
+    k.trigger('DAILY_LOSS_LIMIT', 'RISK_MONITOR')  # database down: queued
+    led.down = False
+    k.reset('OPERATOR', 'reviewed')  # writes the queued engage first, then the reset
+    assert led.events == ['KILL_SWITCH', 'KILL_SWITCH_RESET'] and not k.state()['persist_pending']
+
+
+def test_a_failed_public_ip_lookup_blocks_only_briefly():
+    import httpx
+    from app.netcheck import PublicIP
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectTimeout('blip')
+        return httpx.Response(200, text='203.0.113.7')
+    now = [100.0]
+    p = PublicIP(ttl=300, fail_ttl=15, transport=httpx.MockTransport(handler), clock=lambda: now[0])
+    assert asyncio.run(p.get()) is None
+    now[0] += 10
+    assert asyncio.run(p.get()) is None and len(calls) == 1  # still within the short failure window
+    now[0] += 6
+    assert asyncio.run(p.get()) == '203.0.113.7' and len(calls) == 2
+
+
+def test_login_reset_never_cuts_a_streaming_feed(make_terminal):
+    from app.broker_streams import StreamWorker
+    from app.stream_manager import StreamManager
+    t, _ = make_terminal()
+    sm = StreamManager(None, None, subscriptions={})
+    w = StreamWorker('ANGEL', None)
+    w.state = 'CONNECTED'
+    sm.workers = [w]
+    t.stream_manager = sm
+    assert not w.wake_if_waiting() and not w._wake.is_set()
+    w.state = 'LOGIN_HALTED'
+    assert w.wake_if_waiting() and w._wake.is_set()

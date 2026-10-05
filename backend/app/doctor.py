@@ -4,27 +4,29 @@ Each check says OK, WARN, FAIL or INFO, what it found, and how to fix it. Creden
 presence and format only: no value is ever printed or returned. Run it from the System tab
 (GET /ops/doctor), or on the machine:
 
-    docker compose exec terminal python -m app.doctor           # read-only checks
-    docker compose exec terminal python -m app.doctor --login   # also one real Kotak login
+    docker compose exec terminal python -m app.doctor           # read-only checks of the running terminal
+    docker compose exec terminal python -m app.doctor --login   # plus one Kotak login, through the running terminal
 """
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 
-from .brokers import totp_secret_valid
+from .brokers import MPIN_RE, UCC_RE, kotak_mobile, totp_secret_valid
 from .clockcheck import clock_hint, clock_offset, clock_status
 from .config import DOTENV_FILE, settings
-from .netcheck import KOTAK_HOSTS, PublicIP, host_reachable, static_ip_reasons
+from .netcheck import KOTAK_HOSTS, PublicIP, host_reachable
 
 RANK = {'OK': 0, 'INFO': 0, 'WARN': 1, 'FAIL': 2}
 
 
 def credential_checks():
-    """(name, status, detail, fix) for each Kotak login setting. Values are never included."""
+    """(name, status, detail, fix) for each Kotak login setting, judged by the same rules the login itself
+    applies (brokers.kotak_login_fields), so the two can never disagree. Values are never included."""
     out = []
 
     def item(key, ok, why, fix):
@@ -36,13 +38,13 @@ def credential_checks():
         else:
             out.append((key, 'FAIL', f'set, but {why}', fix))
 
-    item('KOTAK_API_KEY', lambda v: len(v.strip()) >= 8, 'too short for a consumer key',
+    item('KOTAK_API_KEY', lambda v: len(v.strip()) >= 8 and not re.search(r'\s', v.strip()), 'not a consumer key',
          'Copy the consumer key from Kotak Neo > Trade API into section 1 of .env.')
-    item('KOTAK_MOBILE', lambda v: re.fullmatch(r'\+91\d{10}', v.strip()) is not None, 'not +91 followed by 10 digits',
+    item('KOTAK_MOBILE', lambda v: kotak_mobile(v) is not None, 'not an Indian mobile number (+91, then 10 digits starting 6-9)',
          'Write the registered mobile as +919876543210.')
-    item('KOTAK_CLIENT_CODE', lambda v: re.fullmatch(r'[A-Za-z0-9]{4,12}', v.strip()) is not None, 'not a client code (UCC)',
+    item('KOTAK_CLIENT_CODE', lambda v: UCC_RE.fullmatch(v.strip()) is not None, 'not a client code (UCC)',
          'Use your Kotak client code (UCC), letters and digits only.')
-    item('KOTAK_MPIN', lambda v: re.fullmatch(r'\d{6}', v.strip()) is not None, 'not 6 digits', 'Use the 6-digit MPIN of the Kotak Neo app.')
+    item('KOTAK_MPIN', lambda v: MPIN_RE.fullmatch(v.strip()) is not None, 'not digits only', 'Use the 6-digit MPIN of the Kotak Neo app.')
     if settings.kotak_totp_secret:
         ok = totp_secret_valid(settings.kotak_totp_secret)
         out.append(('KOTAK_TOTP_SECRET', 'OK' if ok else 'FAIL', 'set, valid base32' if ok else 'set, but not valid base32',
@@ -78,16 +80,17 @@ async def run_doctor(t=None, login=False, transport=None, public_ip=None, probe_
     add('Clock', 'PC clock vs Kotak', {'OK': 'OK', 'WARN': 'WARN', 'BAD': 'FAIL', 'UNKNOWN': 'WARN'}[st],
         'unknown (Kotak not reachable)' if offset is None else f'{offset:+.1f} s',
         clock_hint(offset) or (None if offset is not None else 'Fix the network check first.'))
-    reasons = static_ip_reasons(ip) if settings.registered_static_ip.strip() else ['STATIC_IP_NOT_CONFIGURED']
-    if not reasons:
-        add('Static IP', 'Public IP', 'OK', f'{ip} matches REGISTERED_STATIC_IP')
-    elif reasons == ['STATIC_IP_NOT_CONFIGURED']:
+    want = settings.registered_static_ip.strip()
+    gate = '' if settings.require_static_ip_match else ' (REQUIRE_STATIC_IP_MATCH=false: orders are not blocked on it)'
+    if not want:
         add('Static IP', 'Public IP', 'WARN' if not settings.live_trading else 'FAIL',
-            f'this PC is {ip or "unknown"}; no static IP registered yet (live data works; orders need one)',
+            f'this PC is {ip or "unknown"}; no static IP registered yet (live data works; orders need one){gate}',
             'Get a static IP from your ISP, register it in Kotak Neo > Trade API, then set REGISTERED_STATIC_IP.')
+    elif ip == want:
+        add('Static IP', 'Public IP', 'OK', f'{ip} matches REGISTERED_STATIC_IP')
     else:
         add('Static IP', 'Public IP', 'FAIL' if settings.live_trading else 'WARN',
-            f'this PC is {ip or "unknown"}, registered is {settings.registered_static_ip}',
+            f'this PC is {ip or "unknown"}, registered is {want}{gate}',
             'Connect through the registered line, or register this IP with Kotak and update REGISTERED_STATIC_IP.')
 
     if t is not None:
@@ -109,9 +112,14 @@ async def run_doctor(t=None, login=False, transport=None, public_ip=None, probe_
         k = t.brokers.items.get('KOTAK')
         if k is not None and hasattr(k, 'login_state'):
             if login and k.configured():
+                # Through the running adapter: halt, backoff, TOTP-window tracking and the re-login budget apply.
+                # A working session is proof enough; no extra login is sent just to test.
                 try:
-                    await k.session(force=True)
-                    add('Kotak login', 'Login test', 'OK', 'logged in now')
+                    if k._fresh():
+                        add('Kotak login', 'Login test', 'OK', f'already logged in ({k.login_state()["session_age_sec"]} s ago); no extra login sent')
+                    else:
+                        await k.session()
+                        add('Kotak login', 'Login test', 'OK', 'logged in now')
                 except Exception as exc:  # noqa: BLE001
                     add('Kotak login', 'Login test', 'FAIL', str(exc)[:200], 'See the detail; fix the setting it names, then Reset KOTAK login.')
             ls = k.login_state()
@@ -152,24 +160,60 @@ def _print(report):
     print(f'\nResult: {report["summary"]}  ({report["took_sec"]} s)')
 
 
+def _from_running_terminal(login):
+    """The report from the running terminal (its own login, feed and halt state), or None if it is not up.
+    The login test always goes through it, so its lockout protection applies."""
+    import httpx
+    url = os.getenv('IORT_URL', 'http://127.0.0.1:8000').rstrip('/')
+    try:
+        if login:
+            r = httpx.post(f'{url}/ops/doctor/login', headers={'X-IORT-Operator-Token': settings.operator_api_token}, timeout=90)
+        else:
+            r = httpx.get(f'{url}/ops/doctor', timeout=60)
+    except httpx.HTTPError:
+        return None
+    if r.status_code == 401:
+        raise SystemExit('The terminal refused the login test: OPERATOR_API_TOKEN does not match the running terminal.')
+    return r.json() if r.status_code == 200 else None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='IORT machine and Kotak login diagnostics')
-    ap.add_argument('--login', action='store_true', help='also perform one real Kotak login (counts toward lockout if refused)')
+    ap.add_argument('--login', action='store_true', help='also perform one real Kotak login through the running terminal')
     ap.add_argument('--json', action='store_true', help='print the report as JSON')
     args = ap.parse_args(argv)
-    from .main import Terminal  # the full terminal object, without starting its loops
-
-    async def go():
-        t = Terminal()
-        await t.bus.connect()
-        try:
-            return await run_doctor(t, login=args.login)
-        finally:
-            await t.brokers.aclose()
-            await t.bus.close()
-    report = asyncio.run(go())
+    report = _from_running_terminal(args.login)
+    if report is None and args.login:
+        print('The terminal is not running: start it first (deploy\\windows\\start.ps1), so the login test respects its lockout protection.')
+        return 2
+    if report is None:
+        report = asyncio.run(_local_report())
     print(json.dumps(report, indent=2)) if args.json else _print(report)
     return 0 if report['ok'] else 1
+
+
+async def _local_report():
+    """Machine checks when the terminal itself is not running. A database that is down is reported,
+    never allowed to stop the other checks."""
+    from .main import Terminal
+    try:
+        t = Terminal()
+    except Exception as exc:  # noqa: BLE001 - e.g. Postgres unreachable while building the ledger
+        r = await run_doctor(None)
+        r['checks'].insert(0, {'group': 'Infrastructure', 'name': 'Database', 'status': 'FAIL',
+                               'detail': f'{type(exc).__name__}: {str(exc)[:160]}',
+                               'fix': 'Start Postgres (docker compose up -d postgres) and check DATABASE_URL and POSTGRES_PASSWORD.'})
+        r['ok'], r['summary'] = False, 'FAIL'
+        return r
+    await t.bus.connect()
+    try:
+        r = await run_doctor(t)
+        r['checks'].insert(0, {'group': 'Config', 'name': 'Terminal', 'status': 'WARN', 'detail': 'not running: login and feed state unknown',
+                               'fix': 'Start it with deploy\\windows\\start.ps1 (or docker compose up -d).'})
+        return r
+    finally:
+        await t.brokers.aclose()
+        await t.bus.close()
 
 
 if __name__ == '__main__':

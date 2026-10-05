@@ -1,9 +1,18 @@
-# Institutional Options Risk Terminal (IORT) 3.3.0
+# Institutional Options Risk Terminal (IORT) 3.3.1
 
 An options risk and option-writing terminal for NSE, BSE and MCX: multi-broker live feeds, a live option chain, portfolio risk with Greeks and full-revaluation scenarios, a strategy builder for hedged option writing, and a pre-trade risk engine that every order passes through.
 
 ## Status
-**3.3.0: production-preparation candidate.** The build is deliberately fail-closed: missing evidence blocks orders instead of guessing. It shows live broker data only, and blank where there is none. `LIVE_TRADING` defaults to false (order routing locked), and live money still needs the controlled evidence listed under *Live-money gate*. It is not a profitability guarantee, an exchange certification, or a claim of equivalence to commercial terminals.
+**3.3.1: production-preparation candidate.** The build is deliberately fail-closed: missing evidence blocks orders instead of guessing. It shows live broker data only, and blank where there is none. `LIVE_TRADING` defaults to false (order routing locked), and live money still needs the controlled evidence listed under *Live-money gate*. It is not a profitability guarantee, an exchange certification, or a claim of equivalence to commercial terminals.
+
+## What is new in 3.3.1
+Fixes from an adversarial review of 3.3.0:
+- **Orders:** a Kotak reply that may have come after an order was forwarded (gateway or server error, timeout, an unexpected body) is now `UNKNOWN`, which blocks new Kotak orders until reconciliation finds it; only a well-formed refusal is `REJECTED`. The order path never logs in or waits for a login.
+- **Lockout safety:** "account locked" / "too many attempts" replies and any 4xx refusal code always count toward the login halt. A one-time `KOTAK_TOTP` is spent the moment it is sent. The clock is measured before every login, and Reset forgets an old measurement. The TOTP window recorded is always the window of the code sent.
+- **No login storms:** the re-login budget now covers forced feed logins, silent-expiry detection and the health probe. The feed forces a fresh login only when the token is really refused, and never while a newer session exists. A failure on an old session never discards a newer one.
+- **Trading day:** a session lasts from one weekday pre-open login (08:50 IST) to the next, so there is no midnight or weekend login and no mid-session re-login.
+- **Self-repair:** Reset KOTAK login wakes a waiting feed but never cuts a streaming one. A kill switch engaged during a database outage keeps every engage and reset in order. A failed public-IP lookup blocks live orders for 15 s, not 5 minutes. Turning auto-reconnect off is always honoured.
+- **Diagnostics:** `python -m app.doctor` reports the running terminal's state, and `--login` goes through it (`POST /ops/doctor/login`, operator token) so its lockout protection applies. It reports a database outage instead of crashing, applies the login's own format rules, and never calls a mismatched static IP "OK".
 
 ## What is new in 3.3.0
 - **Live data only.** No simulated, sample or caller-supplied data reaches the screen or a decision. The HTTP tick-injection endpoint, the calculator endpoints that worked on made-up inputs, and the placeholder modules behind them are gone. Without live data every price, chain, P&L, Greek and chart is blank. A quote older than `DATA_STALE_MS` is blanked, and the strategy builder refuses it. When the backend stops answering, every panel blanks within 7 s. `LIVE_TRADING=false` is now labelled **ORDERS LOCKED**: it is an order interlock, not a "paper" mode.

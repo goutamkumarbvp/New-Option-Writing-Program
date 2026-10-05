@@ -10,6 +10,7 @@ state wins), counting every drop.
 import asyncio
 import contextlib
 import json
+import re
 import time
 
 from .clock import in_session
@@ -41,6 +42,16 @@ def _ms(v):
 
 class StreamError(RuntimeError):
     pass
+
+
+_REFUSED = re.compile(r'invalid|unauthori[sz]ed|expired|denied|refused|forbidden|\b40[13]\b', re.I)
+_NOT_REFUSAL = re.compile(r'time ?out|timed out|connection|closed|reset|unexpected auth response: none', re.I)
+
+
+def token_refused(message):
+    """Did the feed's auth handshake refuse the session token? The SDK raises AuthenticationError for
+    network faults during the handshake too; those must not trigger a fresh broker login."""
+    return bool(_REFUSED.search(message or '')) and not _NOT_REFUSAL.search(message or '')
 
 
 class ThreadBridge:
@@ -140,7 +151,7 @@ class StreamWorker:
 
     def set_auto_reconnect(self, enabled):
         self.auto_reconnect = bool(enabled)
-        if self.auto_reconnect:
+        if self.auto_reconnect and self.state in ('PAUSED', 'RECONNECTING'):
             self.attempt = 0
             self._wake.set()
         return {'broker': self.broker, 'auto_reconnect': self.auto_reconnect, 'state': self.state}
@@ -195,6 +206,14 @@ class StreamWorker:
     def wake(self):
         self._wake.set()
 
+    def wake_if_waiting(self, reason='LOGIN_RESET'):
+        """Retry now if the feed is waiting (backoff, pause or login halt); a connected feed is left alone."""
+        if self.state in ('RECONNECTING', 'PAUSED', 'LOGIN_HALTED', 'IDLE'):
+            self.attempt = 0
+            self._wake.set()
+            return True
+        return False
+
     async def run_forever(self):
         self.running = True
         try:
@@ -202,6 +221,7 @@ class StreamWorker:
                 if self.state != 'RECONNECTING':
                     self.state = 'CONNECTING'
                 self._kick, self._got_data = None, False
+                self._wake.clear()  # a wake left over from an earlier toggle must not skip the next wait or pause
                 reason = None
                 try:
                     self._conn_task = asyncio.ensure_future(self.run_once())
@@ -213,7 +233,7 @@ class StreamWorker:
                     reason = self._kick
                 except Exception as e:  # noqa: BLE001 - every failure is reported and retried
                     reason = str(e)[:200] or type(e).__name__
-                    if type(e).__name__ == 'AuthenticationError' and 'timeout' not in str(e).lower():
+                    if type(e).__name__ == 'AuthenticationError' and token_refused(str(e)):
                         self._relogin = True  # the feed refused the session token: log in again first
                 finally:
                     self._conn_task = None
@@ -570,6 +590,8 @@ class KotakStreamWorker(StreamWorker):
         underlyings = kotak_index_underlyings()
         relogin = self._relogin or self.attempt == max(1, settings.stream_relogin_after_failures)
         self._relogin = False
+        if relogin and self.session_peek is not None and self.session_peek() not in (None, self._conn_session):
+            relogin = False  # a newer session already exists: use it instead of logging in again
         c = await (self.session_provider(force=True) if relogin else self.session_provider())
         self._conn_session = c
         conn = c.create_websocket(**self.SOCKET_OPTIONS)

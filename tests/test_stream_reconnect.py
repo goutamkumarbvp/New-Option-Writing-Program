@@ -288,3 +288,33 @@ def test_reconnect_and_auto_reconnect_endpoints(make_terminal):
         assert t.ledger.audit_records()[-1]['action'] == 'STREAM_AUTO_RECONNECT'
         sm.workers = []
         assert c.post('/brokers/ANGEL/reconnect', headers=h).status_code == 409
+
+
+def test_auto_reconnect_off_after_a_toggle_still_pauses():
+    w = ScriptedWorker(['drop'])
+    w.state = 'CONNECTED'
+    w.set_auto_reconnect(True)   # while connected: no stale wake left behind
+    assert not w._wake.is_set()
+    w.set_auto_reconnect(False)
+    run(w)
+    assert w.waits[0] is None    # paused, waiting for an operator
+
+
+@pytest.mark.parametrize('msg,refused', [
+    ('Authentication failed: invalid token', True), ('Auth refused: 401 Unauthorized', True),
+    ('Authentication failed: ConnectionClosed', False), ('Authentication timeout', False),
+    ('Unexpected auth response: None', False), ('Authentication failed: connection reset by peer', False),
+])
+def test_only_a_real_token_refusal_forces_a_fresh_login(msg, refused):
+    from app.broker_streams import token_refused
+    assert token_refused(msg) is refused
+
+
+def test_no_forced_login_when_a_newer_session_already_exists(settings_override):
+    settings_override(stream_relogin_after_failures=3)
+    newer = object()
+    w, sessions = kotak_worker(FakeFeed(end='close'), session_peek=lambda: newer)
+    w._conn_session, w.attempt = object(), 3
+    with pytest.raises(StreamError):
+        asyncio.run(w.run_once())
+    assert sessions == [False]
